@@ -207,7 +207,7 @@ async function currentRegistration(email, env) {
 function backendBase(request, env) { return env.PUBLIC_BACKEND_URL || new URL(request.url).origin; }
 function oauthRedirectUri(request, env) { return env.GOOGLE_REDIRECT_URI || `${backendBase(request, env)}/auth/google/callback`; }
 function safeReturnTo(value, env) {
-  const fallback = env.FRONTEND_URL || 'https://dinner-six.pages.dev';
+  const fallback = env.FRONTEND_URL || 'https://dinner-six.shijanhoo.workers.dev';
   try {
     const url = new URL(value || fallback);
     const allowed = (env.ALLOWED_RETURN_ORIGINS || env.FRONTEND_URL || '').split(',').map(x => x.trim()).filter(Boolean);

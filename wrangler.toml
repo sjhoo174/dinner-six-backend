@@ -23,7 +23,7 @@ database_id = "ccaa1305-2553-4197-99d8-04c8b36c804f"
 [vars]
 FRONTEND_URL = "https://dinner-six.shijanhoo.workers.dev"
 FRONTEND_ORIGIN = "*"
-ALLOWED_RETURN_ORIGINS = "https://dinner-six.pages.dev,http://127.0.0.1:5173,http://127.0.0.1:5174,http://127.0.0.1:5175,http://127.0.0.1:5176,http://127.0.0.1:5177"
+ALLOWED_RETURN_ORIGINS = "https://dinner-six.shijanhoo.workers.dev"
 PUBLIC_BACKEND_URL = "https://dinner-six-backend.shijanhoo.workers.dev"
 MATCH_WAIT_DAYS_MIN = "2"
 MATCH_WAIT_DAYS_MAX = "4"

@@ -2,11 +2,15 @@ name = "dinner-six-backend"
 main = "src/worker.js"
 compatibility_date = "2026-06-28"
 
-# Optional production hardening:
-# - Set JWT_SECRET with: npx wrangler secret put JWT_SECRET
-# - Set RETURN_DEV_CODES=false once a real email provider is wired.
-# - Add KV namespace bindings below for durable storage. Without them, local/dev
-#   mode uses in-memory storage and deployed Workers may lose data on restart.
+# Production secrets required:
+# - JWT_SECRET: token signing secret
+# - RESEND_API_KEY: API key used to send sign-in codes by email
+# Set with:
+#   npx wrangler secret put JWT_SECRET
+#   npx wrangler secret put RESEND_API_KEY
+#
+# For durable production storage, create and bind KV namespaces below.
+# Without them, Workers may lose in-memory data on restart.
 # [[kv_namespaces]]
 # binding = "AUTH_CODES"
 # id = "<auth-codes-kv-namespace-id>"
@@ -19,6 +23,8 @@ compatibility_date = "2026-06-28"
 
 [vars]
 FRONTEND_ORIGIN = "*"
-RETURN_DEV_CODES = "true"
+RETURN_DEV_CODES = "false"
+EMAIL_PROVIDER = "resend"
+EMAIL_FROM = "DinnerSix <onboarding@resend.dev>"
 MATCH_WAIT_DAYS_MIN = "2"
 MATCH_WAIT_DAYS_MAX = "4"

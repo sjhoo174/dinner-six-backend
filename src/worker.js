@@ -49,6 +49,53 @@ function randomCode() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
+function isTrue(value) {
+  return String(value || '').toLowerCase() === 'true';
+}
+
+function signInEmailHtml(code) {
+  return `
+    <div style="font-family:Inter,Arial,sans-serif;max-width:560px;margin:0 auto;color:#1a1a2e">
+      <h1 style="font-size:28px;margin:0 0 12px">Your DinnerSix sign-in code</h1>
+      <p style="font-size:16px;line-height:1.6;color:#4b4b68">Use this code to sign in and continue your DinnerSix registration:</p>
+      <div style="font-size:34px;font-weight:800;letter-spacing:8px;background:#fff4f8;border:1px solid #ffc1d6;border-radius:16px;padding:18px 24px;text-align:center;margin:24px 0">${code}</div>
+      <p style="font-size:14px;line-height:1.6;color:#6a6a8a">This code expires in 10 minutes. If you did not request it, you can ignore this email.</p>
+    </div>
+  `;
+}
+
+async function sendSignInEmail(email, code, env) {
+  if (isTrue(env.EMAIL_TEST_MODE)) return { ok: true, id: 'test-email' };
+
+  const provider = (env.EMAIL_PROVIDER || 'resend').toLowerCase();
+  if (provider !== 'resend') throw new Error(`Unsupported email provider: ${provider}`);
+  if (!env.RESEND_API_KEY) throw new Error('Email provider is not configured. Set RESEND_API_KEY in Cloudflare.');
+
+  const from = env.EMAIL_FROM || 'DinnerSix <onboarding@resend.dev>';
+  const replyTo = env.EMAIL_REPLY_TO || undefined;
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from,
+      to: email,
+      subject: 'Your DinnerSix sign-in code',
+      html: signInEmailHtml(code),
+      text: `Your DinnerSix sign-in code is ${code}. It expires in 10 minutes.`,
+      ...(replyTo ? { reply_to: replyTo } : {}),
+    }),
+  });
+
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(result.message || result.error || 'Could not send sign-in email');
+  }
+  return result;
+}
+
 function base64UrlEncodeBytes(bytes) {
   let binary = '';
   bytes.forEach(b => { binary += String.fromCharCode(b); });
@@ -183,9 +230,19 @@ async function handle(request, env = {}) {
     const email = normalizeEmail(body.email);
     if (!/^\S+@\S+\.\S+$/.test(email)) return json({ error: 'Valid email is required' }, 400, request, env);
     const code = randomCode();
+    const returnDevCode = isTrue(env.RETURN_DEV_CODES);
+
+    if (!returnDevCode || env.RESEND_API_KEY || isTrue(env.EMAIL_TEST_MODE)) {
+      try {
+        await sendSignInEmail(email, code, env);
+      } catch (error) {
+        return json({ error: error.message || 'Could not send sign-in email' }, 500, request, env);
+      }
+    }
+
     await storePut(authCodeStore(env), `code:${email}`, { code, email, createdAt: Date.now() }, { expirationTtl: 600 });
     const payload = { ok: true, message: 'Sign-in code sent.' };
-    if ((env.RETURN_DEV_CODES ?? 'true') === 'true') payload.devCode = code;
+    if (returnDevCode) payload.devCode = code;
     return json(payload, 200, request, env);
   }
 

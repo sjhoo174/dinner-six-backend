@@ -36,10 +36,10 @@ Email-code sign-in endpoints now return `410 Gone`; use Google OAuth only.
 
 DinnerSix stores user data and preferences in Cloudflare D1 (free-tier friendly relational SQLite):
 
-- `users`: Google email/name/avatar/provider IDs.
+- `users`: Google email and display name.
 - `sessions`: bearer sessions issued after OAuth.
 - `oauth_states`: short-lived OAuth state nonces.
-- `registrations`: email-tagged user profile, phone number, area, budget, preferences, match result, and confirmation status.
+- `registrations`: email-tagged user data including name, phone number, area, budget, preferences, match result, and confirmation status.
 
 Create the database:
 
@@ -63,6 +63,9 @@ npx wrangler d1 migrations apply dinner-six-db --remote
 ```
 
 Local tests use in-memory storage so CI can run without a Cloudflare account, but production should deploy with D1 bound.
+
+If you previously applied an older migration that included `avatar_url`, `provider`, or `provider_id` in `users`, recreate the D1 database or add a follow-up migration to drop those columns before production use. The current schema intentionally keeps only `email`, `name`, `created_at`, and `updated_at` for users.
+
 
 ## Google OAuth setup
 

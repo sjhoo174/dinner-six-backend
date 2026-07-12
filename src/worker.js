@@ -81,17 +81,17 @@ async function verifyToken(token, env) {
 function hasD1(env) { return Boolean(env.DB?.prepare); }
 
 async function getUser(env, email) {
-  if (hasD1(env)) return env.DB.prepare('SELECT email, name, avatar_url AS avatarUrl, provider, provider_id AS providerId, created_at AS createdAt, updated_at AS updatedAt FROM users WHERE email = ?').bind(email).first();
+  if (hasD1(env)) return env.DB.prepare('SELECT email, name, created_at AS createdAt, updated_at AS updatedAt FROM users WHERE email = ?').bind(email).first();
   return memory.users.get(email) || null;
 }
 async function upsertUser(env, user) {
   const existing = await getUser(env, user.email);
-  const record = { ...existing, ...user, updatedAt: nowIso(), createdAt: existing?.createdAt || nowIso() };
+  const record = { email: user.email, name: user.name || existing?.name || '', updatedAt: nowIso(), createdAt: existing?.createdAt || nowIso() };
   if (hasD1(env)) {
-    await env.DB.prepare(`INSERT INTO users (email, name, avatar_url, provider, provider_id, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(email) DO UPDATE SET name = excluded.name, avatar_url = excluded.avatar_url, provider = excluded.provider, provider_id = excluded.provider_id, updated_at = excluded.updated_at`)
-      .bind(record.email, record.name || '', record.avatarUrl || '', record.provider || 'google', record.providerId || '', record.createdAt, record.updatedAt).run();
+    await env.DB.prepare(`INSERT INTO users (email, name, created_at, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(email) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at`)
+      .bind(record.email, record.name, record.createdAt, record.updatedAt).run();
   } else memory.users.set(record.email, record);
   return record;
 }
@@ -155,7 +155,7 @@ async function requireUser(request, env) {
   const session = await getSession(env, token);
   if (!session) return null;
   const profile = await getUser(env, verified.email);
-  return { email: verified.email, token, name: profile?.name || '', avatarUrl: profile?.avatarUrl || '' };
+  return { email: verified.email, token, name: profile?.name || '' };
 }
 
 function overlap(a = [], b = []) { return a.filter(x => b.includes(x)).length; }
@@ -224,7 +224,7 @@ async function exchangeGoogleCode(code, request, env) {
   const info = await infoRes.json().catch(() => ({}));
   if (!infoRes.ok) throw new Error(info.error_description || info.error || 'Could not read Google profile');
   if (!info.email || info.email_verified === false) throw new Error('Google account email must be verified');
-  return { email: normalizeEmail(info.email), name: info.name || '', avatarUrl: info.picture || '', provider: 'google', providerId: info.sub || '' };
+  return { email: normalizeEmail(info.email), name: info.name || '' };
 }
 function redirectWithHash(returnTo, params) {
   const url = new URL(returnTo);
@@ -274,7 +274,7 @@ async function handle(request, env = {}) {
   const user = await requireUser(request, env);
   if (!user) return json({ error: 'Sign in required' }, 401, request, env);
 
-  if (path === '/me' && request.method === 'GET') return json({ user: { email: user.email, name: user.name, avatarUrl: user.avatarUrl }, registration: await currentRegistration(user.email, env) }, 200, request, env);
+  if (path === '/me' && request.method === 'GET') return json({ user: { email: user.email, name: user.name }, registration: await currentRegistration(user.email, env) }, 200, request, env);
   if (path === '/registrations/current' && request.method === 'GET') return json({ registration: await currentRegistration(user.email, env) }, 200, request, env);
 
   if (path === '/registrations' && request.method === 'POST') {

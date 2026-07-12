@@ -1,0 +1,24 @@
+name = "dinner-six-backend"
+main = "src/worker.js"
+compatibility_date = "2026-06-28"
+
+# Optional production hardening:
+# - Set JWT_SECRET with: npx wrangler secret put JWT_SECRET
+# - Set RETURN_DEV_CODES=false once a real email provider is wired.
+# - Add KV namespace bindings below for durable storage. Without them, local/dev
+#   mode uses in-memory storage and deployed Workers may lose data on restart.
+# [[kv_namespaces]]
+# binding = "AUTH_CODES"
+# id = "<auth-codes-kv-namespace-id>"
+# [[kv_namespaces]]
+# binding = "SESSIONS"
+# id = "<sessions-kv-namespace-id>"
+# [[kv_namespaces]]
+# binding = "REGISTRATIONS"
+# id = "<registrations-kv-namespace-id>"
+
+[vars]
+FRONTEND_ORIGIN = "*"
+RETURN_DEV_CODES = "true"
+MATCH_WAIT_DAYS_MIN = "2"
+MATCH_WAIT_DAYS_MAX = "4"

@@ -1,6 +1,6 @@
 # DinnerSix Backend
 
-Cloudflare Worker API for DinnerSix email sign-in, email-tagged registrations, async matching status, and match confirmation.
+Cloudflare Worker API for DinnerSix Google OAuth sign-in, D1-backed user/registration storage, async matching status, and match confirmation.
 
 ## Local development
 
@@ -23,56 +23,84 @@ VITE_API_BASE=http://127.0.0.1:8789 npm run dev
 
 ## API
 
-- `POST /auth/start` — generates a 6-digit sign-in code and emails it to the user.
-- `POST /auth/verify` — verifies the email code and returns a bearer token.
+- `GET /auth/google/start?return_to=<frontend-url>` — redirects to Google OAuth.
+- `GET /auth/google/callback` — Google OAuth callback; creates/updates user, creates a session, redirects back to the frontend with `#auth_token=...`.
 - `GET /me` — returns signed-in user and their current registration, if any.
 - `GET /restaurants` — restaurant preview data.
-- `POST /registrations` — creates/updates the registration for the signed-in email.
+- `POST /registrations` — creates/updates the registration for the signed-in Google email.
 - `POST /match/confirm` — confirms a ready match.
 
-## Email sending
+Email-code sign-in endpoints now return `410 Gone`; use Google OAuth only.
 
-Production uses Resend to send sign-in codes. Dev codes are disabled by default and must not be enabled in production.
+## Cloudflare D1 relational storage
 
-Required production secret:
+DinnerSix stores user data and preferences in Cloudflare D1 (free-tier friendly relational SQLite):
+
+- `users`: Google email/name/avatar/provider IDs.
+- `sessions`: bearer sessions issued after OAuth.
+- `oauth_states`: short-lived OAuth state nonces.
+- `registrations`: email-tagged user profile, phone number, area, budget, preferences, match result, and confirmation status.
+
+Create the database:
 
 ```bash
-npx wrangler secret put RESEND_API_KEY
+npx wrangler d1 create dinner-six-db
 ```
 
-Recommended sender configuration in `wrangler.toml`:
+Copy the returned `database_id` into `wrangler.toml`:
+
+```toml
+[[d1_databases]]
+binding = "DB"
+database_name = "dinner-six-db"
+database_id = "<database_id_from_cloudflare>"
+```
+
+Apply migrations:
+
+```bash
+npx wrangler d1 migrations apply dinner-six-db --remote
+```
+
+Local tests use in-memory storage so CI can run without a Cloudflare account, but production should deploy with D1 bound.
+
+## Google OAuth setup
+
+Create OAuth credentials in Google Cloud Console:
+
+- Application type: Web application
+- Authorized redirect URI:
+
+```txt
+https://dinner-six-backend.shijanhoo.workers.dev/auth/google/callback
+```
+
+Set Cloudflare Worker secrets:
+
+```bash
+npx wrangler secret put JWT_SECRET
+npx wrangler secret put GOOGLE_CLIENT_ID
+npx wrangler secret put GOOGLE_CLIENT_SECRET
+```
+
+Set/confirm Worker vars in `wrangler.toml`:
 
 ```toml
 [vars]
-RETURN_DEV_CODES = "false"
-EMAIL_PROVIDER = "resend"
-EMAIL_FROM = "DinnerSix <hello@your-verified-domain.com>"
+FRONTEND_URL = "https://dinner-six.pages.dev"
+PUBLIC_BACKEND_URL = "https://dinner-six-backend.shijanhoo.workers.dev"
+ALLOWED_RETURN_ORIGINS = "https://dinner-six.pages.dev"
 ```
 
-Important: Resend requires the `EMAIL_FROM` domain to be verified for real production sending. `onboarding@resend.dev` is only suitable for Resend test/onboarding scenarios and may only send to verified account emails.
+For local Vite testing, include local origins in `ALLOWED_RETURN_ORIGINS` as this repo currently does.
 
-For automated tests only, the Worker supports `EMAIL_TEST_MODE=true`; this bypasses the external email API while still confirming that production responses do not expose `devCode`.
-
-## Cloudflare deployment
+## Deployment
 
 ```bash
 npm install
-npx wrangler secret put JWT_SECRET
-npx wrangler secret put RESEND_API_KEY
-npm run deploy
-```
-
-For durable production storage, create three KV namespaces and uncomment/fill the `kv_namespaces` bindings in `wrangler.toml`:
-
-```bash
-npx wrangler kv namespace create AUTH_CODES
-npx wrangler kv namespace create SESSIONS
-npx wrangler kv namespace create REGISTRATIONS
-```
-
-Then redeploy:
-
-```bash
+npm run check
+npm test
+npx wrangler d1 migrations apply dinner-six-db --remote
 npm run deploy
 ```
 
@@ -84,8 +112,10 @@ VITE_API_BASE=https://dinner-six-backend.shijanhoo.workers.dev
 
 ## Required production checklist
 
-- `RETURN_DEV_CODES=false` in Worker vars.
-- `RESEND_API_KEY` set as a Worker secret.
+- D1 database created and `database_id` set in `wrangler.toml`.
+- D1 migration applied remotely.
 - `JWT_SECRET` set as a Worker secret.
-- `EMAIL_FROM` uses a verified sender domain.
-- KV namespaces are bound for `AUTH_CODES`, `SESSIONS`, and `REGISTRATIONS`.
+- `GOOGLE_CLIENT_ID` set as a Worker secret.
+- `GOOGLE_CLIENT_SECRET` set as a Worker secret.
+- Google OAuth redirect URI points to `/auth/google/callback` on the Worker.
+- `FRONTEND_URL` / `ALLOWED_RETURN_ORIGINS` match the deployed frontend domain.

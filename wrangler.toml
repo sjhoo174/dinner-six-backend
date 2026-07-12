@@ -2,29 +2,28 @@ name = "dinner-six-backend"
 main = "src/worker.js"
 compatibility_date = "2026-06-28"
 
-# Production secrets required:
-# - JWT_SECRET: token signing secret
-# - RESEND_API_KEY: API key used to send sign-in codes by email
-# Set with:
+# Required Cloudflare secrets:
 #   npx wrangler secret put JWT_SECRET
-#   npx wrangler secret put RESEND_API_KEY
+#   npx wrangler secret put GOOGLE_CLIENT_ID
+#   npx wrangler secret put GOOGLE_CLIENT_SECRET
 #
-# For durable production storage, create and bind KV namespaces below.
-# Without them, Workers may lose in-memory data on restart.
-# [[kv_namespaces]]
-# binding = "AUTH_CODES"
-# id = "<auth-codes-kv-namespace-id>"
-# [[kv_namespaces]]
-# binding = "SESSIONS"
-# id = "<sessions-kv-namespace-id>"
-# [[kv_namespaces]]
-# binding = "REGISTRATIONS"
-# id = "<registrations-kv-namespace-id>"
+# Required Google OAuth redirect URI:
+#   https://dinner-six-backend.shijanhoo.workers.dev/auth/google/callback
+#
+# Required D1 setup:
+#   npx wrangler d1 create dinner-six-db
+#   Replace database_id below with the created database_id.
+#   npx wrangler d1 migrations apply dinner-six-db --remote
+
+[[d1_databases]]
+binding = "DB"
+database_name = "dinner-six-db"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
 
 [vars]
+FRONTEND_URL = "https://dinner-six.pages.dev"
 FRONTEND_ORIGIN = "*"
-RETURN_DEV_CODES = "false"
-EMAIL_PROVIDER = "resend"
-EMAIL_FROM = "DinnerSix <onboarding@resend.dev>"
+ALLOWED_RETURN_ORIGINS = "https://dinner-six.pages.dev,http://127.0.0.1:5173,http://127.0.0.1:5174,http://127.0.0.1:5175,http://127.0.0.1:5176,http://127.0.0.1:5177"
+PUBLIC_BACKEND_URL = "https://dinner-six-backend.shijanhoo.workers.dev"
 MATCH_WAIT_DAYS_MIN = "2"
 MATCH_WAIT_DAYS_MAX = "4"

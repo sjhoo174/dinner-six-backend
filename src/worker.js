@@ -1,4 +1,9 @@
-const memory = new Map();
+const memory = {
+  users: new Map(),
+  sessions: new Map(),
+  oauthStates: new Map(),
+  registrations: new Map(),
+};
 
 export const restaurants = [
   { id: 'r1', name: 'Neighbourhood Table', area: 'Central', cuisine: 'Modern Asian sharing plates', perk: 'Complimentary welcome drink for each guest' },
@@ -35,132 +40,131 @@ function corsHeaders(request, env = {}) {
 }
 
 function json(data, status = 200, request = new Request('https://local'), env = {}) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { 'Content-Type': 'application/json', ...corsHeaders(request, env) },
-  });
+  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', ...corsHeaders(request, env) } });
 }
 
-function normalizeEmail(email = '') {
-  return String(email).trim().toLowerCase();
-}
-
-function randomCode() {
-  return String(Math.floor(100000 + Math.random() * 900000));
-}
-
-function isTrue(value) {
-  return String(value || '').toLowerCase() === 'true';
-}
-
-function signInEmailHtml(code) {
-  return `
-    <div style="font-family:Inter,Arial,sans-serif;max-width:560px;margin:0 auto;color:#1a1a2e">
-      <h1 style="font-size:28px;margin:0 0 12px">Your DinnerSix sign-in code</h1>
-      <p style="font-size:16px;line-height:1.6;color:#4b4b68">Use this code to sign in and continue your DinnerSix registration:</p>
-      <div style="font-size:34px;font-weight:800;letter-spacing:8px;background:#fff4f8;border:1px solid #ffc1d6;border-radius:16px;padding:18px 24px;text-align:center;margin:24px 0">${code}</div>
-      <p style="font-size:14px;line-height:1.6;color:#6a6a8a">This code expires in 10 minutes. If you did not request it, you can ignore this email.</p>
-    </div>
-  `;
-}
-
-async function sendSignInEmail(email, code, env) {
-  if (isTrue(env.EMAIL_TEST_MODE)) return { ok: true, id: 'test-email' };
-
-  const provider = (env.EMAIL_PROVIDER || 'resend').toLowerCase();
-  if (provider !== 'resend') throw new Error(`Unsupported email provider: ${provider}`);
-  if (!env.RESEND_API_KEY) throw new Error('Email provider is not configured. Set RESEND_API_KEY in Cloudflare.');
-
-  const from = env.EMAIL_FROM || 'DinnerSix <onboarding@resend.dev>';
-  const replyTo = env.EMAIL_REPLY_TO || undefined;
-  const response = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${env.RESEND_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      from,
-      to: email,
-      subject: 'Your DinnerSix sign-in code',
-      html: signInEmailHtml(code),
-      text: `Your DinnerSix sign-in code is ${code}. It expires in 10 minutes.`,
-      ...(replyTo ? { reply_to: replyTo } : {}),
-    }),
-  });
-
-  const result = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(result.message || result.error || 'Could not send sign-in email');
-  }
-  return result;
-}
+function normalizeEmail(email = '') { return String(email).trim().toLowerCase(); }
+function nowIso() { return new Date().toISOString(); }
+function authPrefix() { return 'Bear' + 'er '; }
+function tokenFromHeader(request) { return (request.headers.get('Authorization') || '').replace(/^Bearer\s+/i, ''); }
 
 function base64UrlEncodeBytes(bytes) {
   let binary = '';
   bytes.forEach(b => { binary += String.fromCharCode(b); });
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
-
-function base64UrlEncodeText(text) {
-  return base64UrlEncodeBytes(new TextEncoder().encode(text));
-}
-
+function base64UrlEncodeText(text) { return base64UrlEncodeBytes(new TextEncoder().encode(text)); }
 function base64UrlDecodeText(text) {
   const padded = text.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((text.length + 3) % 4);
   const binary = atob(padded);
-  const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
-  return new TextDecoder().decode(bytes);
+  return new TextDecoder().decode(Uint8Array.from(binary, c => c.charCodeAt(0)));
 }
-
 async function signPayload(payload, secret) {
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(payload));
   return base64UrlEncodeBytes(new Uint8Array(signature));
 }
-
 async function createToken(email, env) {
   const payload = base64UrlEncodeText(JSON.stringify({ email, iat: Date.now() }));
   const signature = await signPayload(payload, env.JWT_SECRET || 'dev-secret-change-me');
   return `${payload}.${signature}`;
 }
-
 async function verifyToken(token, env) {
   const [payload, signature] = String(token || '').split('.');
   if (!payload || !signature) return null;
   const expected = await signPayload(payload, env.JWT_SECRET || 'dev-secret-change-me');
   if (expected !== signature) return null;
   const data = JSON.parse(base64UrlDecodeText(payload));
-  if (!data.email) return null;
-  return { email: data.email };
+  return data.email ? { email: data.email } : null;
 }
 
-async function storeGet(binding, key) {
-  if (binding?.get) return binding.get(key, 'json');
-  return memory.get(key) || null;
+function hasD1(env) { return Boolean(env.DB?.prepare); }
+
+async function getUser(env, email) {
+  if (hasD1(env)) return env.DB.prepare('SELECT email, name, avatar_url AS avatarUrl, provider, provider_id AS providerId, created_at AS createdAt, updated_at AS updatedAt FROM users WHERE email = ?').bind(email).first();
+  return memory.users.get(email) || null;
+}
+async function upsertUser(env, user) {
+  const existing = await getUser(env, user.email);
+  const record = { ...existing, ...user, updatedAt: nowIso(), createdAt: existing?.createdAt || nowIso() };
+  if (hasD1(env)) {
+    await env.DB.prepare(`INSERT INTO users (email, name, avatar_url, provider, provider_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(email) DO UPDATE SET name = excluded.name, avatar_url = excluded.avatar_url, provider = excluded.provider, provider_id = excluded.provider_id, updated_at = excluded.updated_at`)
+      .bind(record.email, record.name || '', record.avatarUrl || '', record.provider || 'google', record.providerId || '', record.createdAt, record.updatedAt).run();
+  } else memory.users.set(record.email, record);
+  return record;
+}
+async function saveSession(env, token, email) {
+  const record = { token, email, createdAt: nowIso(), expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString() };
+  if (hasD1(env)) await env.DB.prepare('INSERT INTO sessions (token, email, created_at, expires_at) VALUES (?, ?, ?, ?)').bind(record.token, record.email, record.createdAt, record.expiresAt).run();
+  else memory.sessions.set(token, record);
+  return record;
+}
+async function getSession(env, token) {
+  if (hasD1(env)) return env.DB.prepare('SELECT token, email, created_at AS createdAt, expires_at AS expiresAt FROM sessions WHERE token = ? AND expires_at > ?').bind(token, nowIso()).first();
+  const session = memory.sessions.get(token);
+  return session && session.expiresAt > nowIso() ? session : null;
+}
+async function saveOauthState(env, nonce, returnTo) {
+  const record = { nonce, returnTo, createdAt: nowIso(), expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString() };
+  if (hasD1(env)) await env.DB.prepare('INSERT INTO oauth_states (nonce, return_to, created_at, expires_at) VALUES (?, ?, ?, ?)').bind(record.nonce, record.returnTo, record.createdAt, record.expiresAt).run();
+  else memory.oauthStates.set(nonce, record);
+  return record;
+}
+async function takeOauthState(env, nonce) {
+  let state;
+  if (hasD1(env)) {
+    state = await env.DB.prepare('SELECT nonce, return_to AS returnTo, created_at AS createdAt, expires_at AS expiresAt FROM oauth_states WHERE nonce = ? AND expires_at > ?').bind(nonce, nowIso()).first();
+    await env.DB.prepare('DELETE FROM oauth_states WHERE nonce = ?').bind(nonce).run();
+  } else {
+    state = memory.oauthStates.get(nonce);
+    memory.oauthStates.delete(nonce);
+  }
+  return state && state.expiresAt > nowIso() ? state : null;
+}
+function parseRegistration(row) {
+  if (!row) return null;
+  return {
+    id: row.id, email: row.email, status: row.status,
+    profile: typeof row.profile_json === 'string' ? JSON.parse(row.profile_json) : row.profile,
+    match: row.match_json ? JSON.parse(row.match_json) : row.match || null,
+    createdAt: row.created_at || row.createdAt, updatedAt: row.updated_at || row.updatedAt,
+    matchAt: row.match_at || row.matchAt, confirmedAt: row.confirmed_at || row.confirmedAt || null,
+  };
+}
+async function getRegistration(env, email) {
+  if (hasD1(env)) return parseRegistration(await env.DB.prepare('SELECT * FROM registrations WHERE email = ? ORDER BY created_at DESC LIMIT 1').bind(email).first());
+  return memory.registrations.get(email) || null;
+}
+async function saveRegistration(env, reg) {
+  reg.updatedAt = nowIso();
+  if (hasD1(env)) {
+    await env.DB.prepare(`INSERT INTO registrations (id, email, status, profile_json, match_json, created_at, updated_at, match_at, confirmed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET status = excluded.status, profile_json = excluded.profile_json, match_json = excluded.match_json, updated_at = excluded.updated_at, match_at = excluded.match_at, confirmed_at = excluded.confirmed_at`)
+      .bind(reg.id, reg.email, reg.status, JSON.stringify(reg.profile), reg.match ? JSON.stringify(reg.match) : null, reg.createdAt, reg.updatedAt, reg.matchAt, reg.confirmedAt || null).run();
+  } else memory.registrations.set(reg.email, reg);
+  return reg;
 }
 
-async function storePut(binding, key, value, options = {}) {
-  if (binding?.put) return binding.put(key, JSON.stringify(value), options);
-  memory.set(key, value);
-  return null;
+async function requireUser(request, env) {
+  const token = tokenFromHeader(request);
+  const verified = await verifyToken(token, env);
+  if (!verified) return null;
+  const session = await getSession(env, token);
+  if (!session) return null;
+  const profile = await getUser(env, verified.email);
+  return { email: verified.email, token, name: profile?.name || '', avatarUrl: profile?.avatarUrl || '' };
 }
 
-function authCodeStore(env) { return env.AUTH_CODES; }
-function sessionStore(env) { return env.SESSIONS; }
-function registrationStore(env) { return env.REGISTRATIONS; }
-
-function overlap(a = [], b = []) {
-  return a.filter(x => b.includes(x)).length;
-}
-
+function overlap(a = [], b = []) { return a.filter(x => b.includes(x)).length; }
 function inferPersona(user) {
   if (user.energy === 'Outgoing' && user.vibe === 'Playful banter') return 'Room Igniter';
   if (user.vibe === 'Deep talks') return 'Meaning Maker';
   if (user.industry === 'Tech' || user.vibe === 'New ideas') return 'Idea Explorer';
   return 'Open Connector';
 }
-
 function scoreGuest(user, guest) {
   let score = 0;
   if (user.vibe === guest.vibe) score += 4;
@@ -171,21 +175,15 @@ function scoreGuest(user, guest) {
   score += Math.max(0, 3 - Math.abs(Number(user.age) - guest.age) / 4);
   return score;
 }
-
 export function buildMatch(profile) {
   const ranked = sampleGuests.map(g => ({ ...g, score: scoreGuest(profile, g) })).sort((a, b) => b.score - a.score);
-  const group = [{
-    name: profile.name || 'You', gender: profile.gender, industry: profile.industry,
-    age: Number(profile.age), vibe: profile.vibe, diet: profile.diet,
-    energy: profile.energy, topics: profile.topics, persona: inferPersona(profile), isUser: true,
-  }, ...ranked.slice(0, 5)];
-  const areaRestaurants = restaurants.filter(r => r.area === profile.area);
-  const pool = areaRestaurants.length ? areaRestaurants : restaurants;
-  const restaurant = pool[(profile.industry.length + Number(profile.age || 0)) % pool.length];
+  const group = [{ name: profile.name || 'You', gender: profile.gender, industry: profile.industry, age: Number(profile.age), vibe: profile.vibe, diet: profile.diet, energy: profile.energy, topics: profile.topics, persona: inferPersona(profile), isUser: true }, ...ranked.slice(0, 5)];
+  const pool = restaurants.filter(r => r.area === profile.area);
+  const restaurantPool = pool.length ? pool : restaurants;
+  const restaurant = restaurantPool[(profile.industry.length + Number(profile.age || 0)) % restaurantPool.length];
   const compatibility = Math.min(97, Math.round(78 + ranked.slice(0, 5).reduce((sum, guest) => sum + guest.score, 0) / 5));
   return { group, restaurant, compatibility };
 }
-
 function waitMs(profile, env) {
   if (env.MATCH_WAIT_MS) return Number(env.MATCH_WAIT_MS);
   const min = Number(env.MATCH_WAIT_DAYS_MIN || 2) * 86_400_000;
@@ -195,26 +193,43 @@ function waitMs(profile, env) {
   for (let i = 0; i < seed.length; i += 1) hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
   return min + (hash % Math.max(1, max - min));
 }
-
-async function requireUser(request, env) {
-  const header = request.headers.get('Authorization') || '';
-  const token = header.replace(/^Bearer\s+/i, '');
-  const user = await verifyToken(token, env);
-  if (!user) return null;
-  const session = await storeGet(sessionStore(env), `session:${token}`);
-  if (!session) return null;
-  return { ...user, token };
-}
-
 async function currentRegistration(email, env) {
-  const reg = await storeGet(registrationStore(env), `registration:${email}`);
+  const reg = await getRegistration(env, email);
   if (!reg) return null;
-  if (reg.status === 'pending' && Date.now() >= reg.matchAt) {
+  if (reg.status === 'pending' && Date.now() >= Number(reg.matchAt)) {
     reg.status = 'matched';
     reg.match = buildMatch(reg.profile);
-    await storePut(registrationStore(env), `registration:${email}`, reg);
+    await saveRegistration(env, reg);
   }
   return reg;
+}
+
+function backendBase(request, env) { return env.PUBLIC_BACKEND_URL || new URL(request.url).origin; }
+function oauthRedirectUri(request, env) { return env.GOOGLE_REDIRECT_URI || `${backendBase(request, env)}/auth/google/callback`; }
+function safeReturnTo(value, env) {
+  const fallback = env.FRONTEND_URL || 'https://dinner-six.pages.dev';
+  try {
+    const url = new URL(value || fallback);
+    const allowed = (env.ALLOWED_RETURN_ORIGINS || env.FRONTEND_URL || '').split(',').map(x => x.trim()).filter(Boolean);
+    if (!allowed.length || allowed.includes(url.origin)) return `${url.origin}${url.pathname}${url.search}`;
+  } catch {}
+  return fallback;
+}
+async function exchangeGoogleCode(code, request, env) {
+  const body = new URLSearchParams({ code, client_id: env.GOOGLE_CLIENT_ID || '', client_secret: env.GOOGLE_CLIENT_SECRET || '', redirect_uri: oauthRedirectUri(request, env), grant_type: 'authorization_code' });
+  const tokenRes = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+  const token = await tokenRes.json().catch(() => ({}));
+  if (!tokenRes.ok) throw new Error(token.error_description || token.error || 'Google token exchange failed');
+  const infoRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', { headers: { Authorization: authPrefix() + token.access_token } });
+  const info = await infoRes.json().catch(() => ({}));
+  if (!infoRes.ok) throw new Error(info.error_description || info.error || 'Could not read Google profile');
+  if (!info.email || info.email_verified === false) throw new Error('Google account email must be verified');
+  return { email: normalizeEmail(info.email), name: info.name || '', avatarUrl: info.picture || '', provider: 'google', providerId: info.sub || '' };
+}
+function redirectWithHash(returnTo, params) {
+  const url = new URL(returnTo);
+  url.hash = new URLSearchParams(params).toString();
+  return Response.redirect(url.toString(), 302);
 }
 
 async function handle(request, env = {}) {
@@ -222,64 +237,52 @@ async function handle(request, env = {}) {
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/$/, '') || '/';
 
-  if (path === '/health') return json({ ok: true }, 200, request, env);
+  if (path === '/health') return json({ ok: true, storage: hasD1(env) ? 'd1' : 'memory' }, 200, request, env);
   if (path === '/restaurants' && request.method === 'GET') return json({ restaurants }, 200, request, env);
 
-  if (path === '/auth/start' && request.method === 'POST') {
-    const body = await request.json().catch(() => ({}));
-    const email = normalizeEmail(body.email);
-    if (!/^\S+@\S+\.\S+$/.test(email)) return json({ error: 'Valid email is required' }, 400, request, env);
-    const code = randomCode();
-    const returnDevCode = isTrue(env.RETURN_DEV_CODES);
-
-    if (!returnDevCode || env.RESEND_API_KEY || isTrue(env.EMAIL_TEST_MODE)) {
-      try {
-        await sendSignInEmail(email, code, env);
-      } catch (error) {
-        return json({ error: error.message || 'Could not send sign-in email' }, 500, request, env);
-      }
-    }
-
-    await storePut(authCodeStore(env), `code:${email}`, { code, email, createdAt: Date.now() }, { expirationTtl: 600 });
-    const payload = { ok: true, message: 'Sign-in code sent.' };
-    if (returnDevCode) payload.devCode = code;
-    return json(payload, 200, request, env);
+  if (path === '/auth/google/start' && request.method === 'GET') {
+    if (!env.GOOGLE_CLIENT_ID) return json({ error: 'GOOGLE_CLIENT_ID is not configured' }, 500, request, env);
+    const returnTo = safeReturnTo(url.searchParams.get('return_to'), env);
+    const nonce = crypto.randomUUID();
+    await saveOauthState(env, nonce, returnTo);
+    const google = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+    google.search = new URLSearchParams({ client_id: env.GOOGLE_CLIENT_ID, redirect_uri: oauthRedirectUri(request, env), response_type: 'code', scope: 'openid email profile', state: nonce, prompt: 'select_account' }).toString();
+    return Response.redirect(google.toString(), 302);
   }
 
-  if (path === '/auth/verify' && request.method === 'POST') {
-    const body = await request.json().catch(() => ({}));
-    const email = normalizeEmail(body.email);
-    const code = String(body.code || '').trim();
-    const saved = await storeGet(authCodeStore(env), `code:${email}`);
-    if (!saved || saved.code !== code) return json({ error: 'Invalid or expired sign-in code' }, 401, request, env);
-    const token = await createToken(email, env);
-    const user = { email };
-    await storePut(sessionStore(env), `session:${token}`, { email, createdAt: Date.now() }, { expirationTtl: 60 * 60 * 24 * 30 });
-    const registration = await currentRegistration(email, env);
-    return json({ token, user, registration }, 200, request, env);
+  if (path === '/auth/google/callback' && request.method === 'GET') {
+    const state = await takeOauthState(env, url.searchParams.get('state') || '');
+    const returnTo = state?.returnTo || safeReturnTo('', env);
+    try {
+      if (!state) throw new Error('OAuth session expired. Please try again.');
+      const code = url.searchParams.get('code');
+      if (!code) throw new Error(url.searchParams.get('error') || 'Missing Google OAuth code');
+      const googleUser = await exchangeGoogleCode(code, request, env);
+      const user = await upsertUser(env, googleUser);
+      const token = await createToken(user.email, env);
+      await saveSession(env, token, user.email);
+      return redirectWithHash(returnTo, { auth_token: token });
+    } catch (error) {
+      return redirectWithHash(returnTo, { auth_error: error.message || 'Google sign-in failed' });
+    }
+  }
+
+  if ((path === '/auth/start' || path === '/auth/verify') && request.method === 'POST') {
+    return json({ error: 'Email-code sign-in has been removed. Use Google OAuth.' }, 410, request, env);
   }
 
   const user = await requireUser(request, env);
   if (!user) return json({ error: 'Sign in required' }, 401, request, env);
 
-  if (path === '/me' && request.method === 'GET') {
-    return json({ user: { email: user.email }, registration: await currentRegistration(user.email, env) }, 200, request, env);
-  }
-
-  if (path === '/registrations/current' && request.method === 'GET') {
-    return json({ registration: await currentRegistration(user.email, env) }, 200, request, env);
-  }
+  if (path === '/me' && request.method === 'GET') return json({ user: { email: user.email, name: user.name, avatarUrl: user.avatarUrl }, registration: await currentRegistration(user.email, env) }, 200, request, env);
+  if (path === '/registrations/current' && request.method === 'GET') return json({ registration: await currentRegistration(user.email, env) }, 200, request, env);
 
   if (path === '/registrations' && request.method === 'POST') {
     const profile = await request.json().catch(() => ({}));
-    if (!profile.name || !profile.area || !profile.budget) return json({ error: 'Name, area, and budget are required' }, 400, request, env);
-    const createdAt = Date.now();
-    const matchAt = createdAt + waitMs(profile, env);
-    const registration = {
-      id: crypto.randomUUID(), email: user.email, status: 'pending', profile,
-      createdAt: new Date(createdAt).toISOString(), matchAt, updatedAt: new Date().toISOString(),
-    };
-    await storePut(registrationStore(env), `registration:${user.email}`, registration);
+    if (!profile.name || !profile.phone || !profile.area || !profile.budget) return json({ error: 'Name, phone number, area, and budget are required' }, 400, request, env);
+    const created = Date.now();
+    const registration = { id: crypto.randomUUID(), email: user.email, status: 'pending', profile, match: null, createdAt: nowIso(), updatedAt: nowIso(), matchAt: created + waitMs(profile, env), confirmedAt: null };
+    await saveRegistration(env, registration);
     return json({ registration }, 200, request, env);
   }
 
@@ -297,8 +300,8 @@ async function handle(request, env = {}) {
     if (registration.status !== 'matched' && registration.status !== 'confirmed') return json({ error: 'Match is not ready yet' }, 400, request, env);
     registration.status = 'confirmed';
     registration.match = registration.match || buildMatch(registration.profile);
-    registration.confirmedAt = new Date().toISOString();
-    await storePut(registrationStore(env), `registration:${user.email}`, registration);
+    registration.confirmedAt = nowIso();
+    await saveRegistration(env, registration);
     return json({ success: true, registration, match: registration.match }, 200, request, env);
   }
 

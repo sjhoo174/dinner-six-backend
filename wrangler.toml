@@ -6,6 +6,7 @@ compatibility_date = "2026-06-28"
 #   npx wrangler secret put JWT_SECRET
 #   npx wrangler secret put GOOGLE_CLIENT_ID
 #   npx wrangler secret put GOOGLE_CLIENT_SECRET
+#   npx wrangler secret put TURNSTILE_SECRET_KEY
 #
 # Required Google OAuth redirect URI:
 #   https://dinner-six-backend.shijanhoo.workers.dev/auth/google/callback
@@ -27,3 +28,4 @@ ALLOWED_RETURN_ORIGINS = "https://dinner-six.shijanhoo.workers.dev"
 PUBLIC_BACKEND_URL = "https://dinner-six-backend.shijanhoo.workers.dev"
 MATCH_WAIT_DAYS_MIN = "2"
 MATCH_WAIT_DAYS_MAX = "4"
+RATING_WINDOW_HOURS = "3"

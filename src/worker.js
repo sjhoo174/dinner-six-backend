@@ -3,28 +3,18 @@ const memory = {
   sessions: new Map(),
   oauthStates: new Map(),
   registrations: new Map(),
+  matchGroups: new Map(),
+  matchGroupMembers: new Map(),
+  ratings: new Map(),
 };
 
-export const restaurants = [
+export const defaultRestaurants = [
   { id: 'r1', name: 'Neighbourhood Table', area: 'Central', cuisine: 'Modern Asian sharing plates', perk: 'Complimentary welcome drink for each guest' },
   { id: 'r2', name: 'The Long Bar Table', area: 'East', cuisine: 'Mediterranean tapas', perk: 'Shared appetiser platter on the house' },
   { id: 'r3', name: 'Supper Club Social', area: 'CBD', cuisine: 'Casual bistro and cocktails', perk: 'Extended happy-hour pricing for the group' },
   { id: 'r4', name: 'Westside Noodle Room', area: 'West', cuisine: 'Modern noodles and small plates', perk: 'Dessert platter for the table' },
   { id: 'r5', name: 'North Garden Social', area: 'North', cuisine: 'Casual garden bistro', perk: 'Free zero-proof welcome spritz' },
   { id: 'r6', name: 'NEX Table Club', area: 'North-East', cuisine: 'Asian-European comfort plates', perk: 'Chef snack to share' },
-];
-
-export const sampleGuests = [
-  { name: 'Alicia', gender: 'Female', industry: 'Product', age: 29, vibe: 'Deep talks', diet: 'No restrictions', energy: 'Balanced', topics: ['Startups','Travel','Food'], persona: 'Curious Builder' },
-  { name: 'Marcus', gender: 'Male', industry: 'Finance', age: 31, vibe: 'Playful banter', diet: 'No pork', energy: 'Outgoing', topics: ['Markets','Fitness','Comedy'], persona: 'Social Strategist' },
-  { name: 'Priya', gender: 'Female', industry: 'Healthcare', age: 28, vibe: 'Deep talks', diet: 'Vegetarian', energy: 'Calm', topics: ['Wellness','Books','Culture'], persona: 'Thoughtful Connector' },
-  { name: 'Daniel', gender: 'Male', industry: 'Design', age: 34, vibe: 'Playful banter', diet: 'No restrictions', energy: 'Balanced', topics: ['Art','Music','Architecture'], persona: 'Creative Spark' },
-  { name: 'Mei', gender: 'Female', industry: 'Tech', age: 27, vibe: 'New ideas', diet: 'No seafood', energy: 'Outgoing', topics: ['AI','Gaming','Travel'], persona: 'Future Tinkerer' },
-  { name: 'Sam', gender: 'Non-binary', industry: 'Education', age: 32, vibe: 'Deep talks', diet: 'Halal-friendly', energy: 'Calm', topics: ['Language','Films','Social impact'], persona: 'Warm Facilitator' },
-  { name: 'Theo', gender: 'Male', industry: 'Marketing', age: 30, vibe: 'Playful banter', diet: 'No restrictions', energy: 'Outgoing', topics: ['Brands','Nightlife','Sports'], persona: 'Conversation Starter' },
-  { name: 'Nadia', gender: 'Female', industry: 'Law', age: 35, vibe: 'New ideas', diet: 'No beef', energy: 'Balanced', topics: ['Policy','Food','Theatre'], persona: 'Insight Hunter' },
-  { name: 'Jun', gender: 'Male', industry: 'Engineering', age: 26, vibe: 'New ideas', diet: 'No restrictions', energy: 'Calm', topics: ['Robotics','Climbing','Coffee'], persona: 'Quiet Inventor' },
-  { name: 'Farah', gender: 'Female', industry: 'Hospitality', age: 33, vibe: 'Playful banter', diet: 'Halal-friendly', energy: 'Outgoing', topics: ['Restaurants','Travel','Events'], persona: 'Host Energy' },
 ];
 
 function corsHeaders(request, env = {}) {
@@ -131,6 +121,7 @@ function parseRegistration(row) {
     match: row.match_json ? JSON.parse(row.match_json) : row.match || null,
     createdAt: row.created_at || row.createdAt, updatedAt: row.updated_at || row.updatedAt,
     matchAt: row.match_at || row.matchAt, confirmedAt: row.confirmed_at || row.confirmedAt || null,
+    matchedGroupId: row.matched_group_id ?? row.matchedGroupId ?? null,
   };
 }
 async function getRegistration(env, email) {
@@ -140,10 +131,10 @@ async function getRegistration(env, email) {
 async function saveRegistration(env, reg) {
   reg.updatedAt = nowIso();
   if (hasD1(env)) {
-    await env.DB.prepare(`INSERT INTO registrations (id, email, status, profile_json, match_json, created_at, updated_at, match_at, confirmed_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET status = excluded.status, profile_json = excluded.profile_json, match_json = excluded.match_json, updated_at = excluded.updated_at, match_at = excluded.match_at, confirmed_at = excluded.confirmed_at`)
-      .bind(reg.id, reg.email, reg.status, JSON.stringify(reg.profile), reg.match ? JSON.stringify(reg.match) : null, reg.createdAt, reg.updatedAt, reg.matchAt, reg.confirmedAt || null).run();
+    await env.DB.prepare(`INSERT INTO registrations (id, email, status, profile_json, match_json, created_at, updated_at, match_at, confirmed_at, matched_group_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET status = excluded.status, profile_json = excluded.profile_json, match_json = excluded.match_json, updated_at = excluded.updated_at, match_at = excluded.match_at, confirmed_at = excluded.confirmed_at, matched_group_id = excluded.matched_group_id`)
+      .bind(reg.id, reg.email, reg.status, JSON.stringify(reg.profile), reg.match ? JSON.stringify(reg.match) : null, reg.createdAt, reg.updatedAt, reg.matchAt, reg.confirmedAt || null, reg.matchedGroupId || null).run();
   } else memory.registrations.set(reg.email, reg);
   return reg;
 }
@@ -158,32 +149,80 @@ async function requireUser(request, env) {
   return { email: verified.email, token, name: profile?.name || '' };
 }
 
-function overlap(a = [], b = []) { return a.filter(x => b.includes(x)).length; }
 function inferPersona(user) {
   if (user.energy === 'Outgoing' && user.vibe === 'Playful banter') return 'Room Igniter';
   if (user.vibe === 'Deep talks') return 'Meaning Maker';
   if (user.industry === 'Tech' || user.vibe === 'New ideas') return 'Idea Explorer';
   return 'Open Connector';
 }
-function scoreGuest(user, guest) {
-  let score = 0;
-  if (user.vibe === guest.vibe) score += 4;
-  if (user.energy === guest.energy) score += 3;
-  if (user.budget) score += 1;
-  if (user.diet === guest.diet || guest.diet === 'No restrictions') score += 1;
-  score += overlap(user.topics || [], guest.topics) * 2;
-  score += Math.max(0, 3 - Math.abs(Number(user.age) - guest.age) / 4);
-  return score;
+
+async function getRestaurants(env) {
+  if (hasD1(env)) {
+    const res = await env.DB.prepare('SELECT id, name, area, cuisine, perk FROM restaurants WHERE active = 1 ORDER BY id').all();
+    return res.results || [];
+  }
+  return defaultRestaurants;
 }
-export function buildMatch(profile) {
-  const ranked = sampleGuests.map(g => ({ ...g, score: scoreGuest(profile, g) })).sort((a, b) => b.score - a.score);
-  const group = [{ name: profile.name || 'You', gender: profile.gender, industry: profile.industry, age: Number(profile.age), vibe: profile.vibe, diet: profile.diet, energy: profile.energy, topics: profile.topics, persona: inferPersona(profile), isUser: true }, ...ranked.slice(0, 5)];
-  const pool = restaurants.filter(r => r.area === profile.area);
-  const restaurantPool = pool.length ? pool : restaurants;
-  const restaurant = restaurantPool[(profile.industry.length + Number(profile.age || 0)) % restaurantPool.length];
-  const compatibility = Math.min(97, Math.round(78 + ranked.slice(0, 5).reduce((sum, guest) => sum + guest.score, 0) / 5));
-  return { group, restaurant, compatibility };
+
+async function getMatchGroup(env, groupId) {
+  if (!groupId) return null;
+  if (hasD1(env)) return env.DB.prepare('SELECT * FROM match_groups WHERE id = ?').bind(groupId).first();
+  return memory.matchGroups.get(groupId) || null;
 }
+
+async function getMatchGroupMembers(env, groupId) {
+  if (hasD1(env)) {
+    const res = await env.DB.prepare(`
+      SELECT mgm.group_id AS groupId, mgm.email AS email, mgm.registration_id AS registrationId,
+             mgm.attendance_status AS attendanceStatus, r.profile_json AS profileJson
+      FROM match_group_members mgm
+      JOIN registrations r ON r.id = mgm.registration_id
+      WHERE mgm.group_id = ?
+    `).bind(groupId).all();
+    return res.results || [];
+  }
+  const members = memory.matchGroupMembers.get(groupId) || [];
+  return members.map(m => {
+    const reg = memory.registrations.get(m.email);
+    return { ...m, profileJson: reg ? JSON.stringify(reg.profile) : '{}' };
+  });
+}
+
+async function findMembership(env, groupId, email) {
+  if (hasD1(env)) return env.DB.prepare('SELECT * FROM match_group_members WHERE group_id = ? AND email = ?').bind(groupId, email).first();
+  const members = memory.matchGroupMembers.get(groupId) || [];
+  return members.find(m => m.email === email) || null;
+}
+
+async function loadMatchForRegistration(env, reg) {
+  if (!reg.matchedGroupId) return null;
+  const group = await getMatchGroup(env, reg.matchedGroupId);
+  if (!group) return null;
+  const members = await getMatchGroupMembers(env, group.id);
+  const restaurant = JSON.parse(group.restaurant_json || group.restaurantJson || 'null');
+  const eventAt = group.event_at || group.eventAt || null;
+  const eventEndsAt = group.event_ends_at || group.eventEndsAt || null;
+  const ratingWindowHours = Number(env.RATING_WINDOW_HOURS || 3);
+  const ratingWindowOpensAt = eventEndsAt ? new Date(new Date(eventEndsAt).getTime() + ratingWindowHours * 3600000).toISOString() : null;
+  return {
+    groupId: group.id,
+    restaurant,
+    eventAt,
+    eventEndsAt,
+    ratingWindowOpensAt,
+    group: members.map(m => {
+      const profile = typeof m.profileJson === 'string' ? JSON.parse(m.profileJson) : (m.profile || {});
+      return {
+        registrationId: m.registrationId,
+        name: profile.name, industry: profile.industry, gender: profile.gender,
+        vibe: profile.vibe, energy: profile.energy, topics: profile.topics,
+        persona: inferPersona(profile), isUser: m.email === reg.email,
+        attendanceStatus: m.attendanceStatus || 'unknown',
+      };
+    }),
+  };
+}
+
 function waitMs(profile, env) {
   if (env.MATCH_WAIT_MS) return Number(env.MATCH_WAIT_MS);
   const min = Number(env.MATCH_WAIT_DAYS_MIN || 2) * 86_400_000;
@@ -196,12 +235,20 @@ function waitMs(profile, env) {
 async function currentRegistration(email, env) {
   const reg = await getRegistration(env, email);
   if (!reg) return null;
-  if (reg.status === 'pending' && Date.now() >= Number(reg.matchAt)) {
-    reg.status = 'matched';
-    reg.match = buildMatch(reg.profile);
-    await saveRegistration(env, reg);
+  if (reg.matchedGroupId && (reg.status === 'matched' || reg.status === 'confirmed')) {
+    reg.match = await loadMatchForRegistration(env, reg);
+  } else {
+    reg.match = null;
   }
   return reg;
+}
+
+async function verifyTurnstile(token, remoteIp, env) {
+  if (!env.TURNSTILE_SECRET_KEY) return true;
+  const body = new URLSearchParams({ secret: env.TURNSTILE_SECRET_KEY, response: token || '', remoteip: remoteIp || '' });
+  const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', { method: 'POST', body });
+  const data = await res.json().catch(() => ({}));
+  return Boolean(data.success);
 }
 
 function backendBase(request, env) { return env.PUBLIC_BACKEND_URL || new URL(request.url).origin; }
@@ -237,8 +284,8 @@ async function handle(request, env = {}) {
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/$/, '') || '/';
 
-  if (path === '/health') return json({ ok: true, storage: hasD1(env) ? 'd1' : 'memory' }, 200, request, env);
-  if (path === '/restaurants' && request.method === 'GET') return json({ restaurants }, 200, request, env);
+  if (path === '/health') return json({ ok: true, storage: hasD1(env) ? 'd1' : 'memory', captchaEnabled: Boolean(env.TURNSTILE_SECRET_KEY) }, 200, request, env);
+  if (path === '/restaurants' && request.method === 'GET') return json({ restaurants: await getRestaurants(env) }, 200, request, env);
 
   if (path === '/auth/google/start' && request.method === 'GET') {
     if (!env.GOOGLE_CLIENT_ID) return json({ error: 'GOOGLE_CLIENT_ID is not configured' }, 500, request, env);
@@ -279,9 +326,14 @@ async function handle(request, env = {}) {
 
   if (path === '/registrations' && request.method === 'POST') {
     const profile = await request.json().catch(() => ({}));
+    const remoteIp = request.headers.get('CF-Connecting-IP');
+    const turnstileOk = await verifyTurnstile(profile.turnstileToken, remoteIp, env);
+    if (!turnstileOk) return json({ error: 'Captcha verification failed. Please try again.' }, 400, request, env);
+    delete profile.turnstileToken;
     if (!profile.name || !profile.phone || !profile.area || !profile.budget) return json({ error: 'Name, phone number, area, and budget are required' }, 400, request, env);
+    if (profile.gender && !['Male', 'Female'].includes(profile.gender)) return json({ error: 'Gender must be Male or Female' }, 400, request, env);
     const created = Date.now();
-    const registration = { id: crypto.randomUUID(), email: user.email, status: 'pending', profile, match: null, createdAt: nowIso(), updatedAt: nowIso(), matchAt: created + waitMs(profile, env), confirmedAt: null };
+    const registration = { id: crypto.randomUUID(), email: user.email, status: 'pending', profile, match: null, createdAt: nowIso(), updatedAt: nowIso(), matchAt: created + waitMs(profile, env), confirmedAt: null, matchedGroupId: null };
     await saveRegistration(env, registration);
     return json({ registration }, 200, request, env);
   }
@@ -298,15 +350,100 @@ async function handle(request, env = {}) {
     const registration = await currentRegistration(user.email, env);
     if (!registration || registration.id !== body.registrationId) return json({ error: 'Registration not found' }, 404, request, env);
     if (registration.status !== 'matched' && registration.status !== 'confirmed') return json({ error: 'Match is not ready yet' }, 400, request, env);
+    if (!registration.match) return json({ error: 'Match is not ready yet' }, 400, request, env);
     registration.status = 'confirmed';
-    registration.match = registration.match || buildMatch(registration.profile);
     registration.confirmedAt = nowIso();
     await saveRegistration(env, registration);
     return json({ success: true, registration, match: registration.match }, 200, request, env);
   }
 
+  if (path === '/attendance' && request.method === 'POST') {
+    const body = await request.json().catch(() => ({}));
+    const allowedStatus = ['on_time', 'late', 'not_showing'];
+    if (!allowedStatus.includes(body.status)) return json({ error: 'status must be one of on_time, late, not_showing' }, 400, request, env);
+    const group = await getMatchGroup(env, body.groupId);
+    if (!group) return json({ error: 'Match group not found' }, 404, request, env);
+    const membership = await findMembership(env, body.groupId, user.email);
+    if (!membership) return json({ error: 'Not a member of this group' }, 404, request, env);
+    const eventAt = group.event_at || group.eventAt;
+    if (eventAt && Date.now() >= new Date(eventAt).getTime()) return json({ error: 'Attendance can only be set before the event' }, 400, request, env);
+    const updatedAt = nowIso();
+    if (hasD1(env)) {
+      await env.DB.prepare('UPDATE match_group_members SET attendance_status = ?, attendance_updated_at = ? WHERE group_id = ? AND email = ?')
+        .bind(body.status, updatedAt, body.groupId, user.email).run();
+    } else {
+      const members = memory.matchGroupMembers.get(body.groupId) || [];
+      const member = members.find(m => m.email === user.email);
+      if (member) { member.attendanceStatus = body.status; member.attendanceUpdatedAt = updatedAt; }
+    }
+    return json({ success: true, attendanceStatus: body.status }, 200, request, env);
+  }
+
+  if (path === '/ratings' && request.method === 'POST') {
+    const body = await request.json().catch(() => ({}));
+    const rating = Number(body.rating);
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) return json({ error: 'rating must be an integer from 1 to 5' }, 400, request, env);
+    const group = await getMatchGroup(env, body.groupId);
+    if (!group) return json({ error: 'Match group not found' }, 404, request, env);
+    const raterMembership = await findMembership(env, body.groupId, user.email);
+    if (!raterMembership) return json({ error: 'Not a member of this group' }, 404, request, env);
+    const members = await getMatchGroupMembers(env, body.groupId);
+    const ratee = members.find(m => m.registrationId === body.rateeRegistrationId);
+    if (!ratee) return json({ error: 'Rated member not found in this group' }, 404, request, env);
+    if (ratee.email === user.email) return json({ error: 'Cannot rate yourself' }, 400, request, env);
+    const eventEndsAt = group.event_ends_at || group.eventEndsAt;
+    const ratingWindowHours = Number(env.RATING_WINDOW_HOURS || 3);
+    const opensAt = eventEndsAt ? new Date(eventEndsAt).getTime() + ratingWindowHours * 3600000 : Infinity;
+    if (Date.now() < opensAt) return json({ error: `Ratings open ${ratingWindowHours} hours after the event ends` }, 400, request, env);
+    const createdAt = nowIso();
+    const comment = typeof body.comment === 'string' ? body.comment.slice(0, 500) : null;
+    if (hasD1(env)) {
+      await env.DB.prepare(`INSERT INTO ratings (id, group_id, rater_email, ratee_email, rating, comment, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(group_id, rater_email, ratee_email) DO UPDATE SET rating = excluded.rating, comment = excluded.comment, created_at = excluded.created_at`)
+        .bind(crypto.randomUUID(), body.groupId, user.email, ratee.email, rating, comment, createdAt).run();
+    } else {
+      memory.ratings.set(`${body.groupId}:${user.email}:${ratee.email}`, { groupId: body.groupId, raterEmail: user.email, rateeEmail: ratee.email, rating, comment, createdAt });
+    }
+    return json({ success: true, rating: { rateeRegistrationId: body.rateeRegistrationId, rating, comment } }, 200, request, env);
+  }
+
+  if (path === '/ratings/mine' && request.method === 'GET') {
+    const groupId = url.searchParams.get('groupId') || '';
+    const members = await getMatchGroupMembers(env, groupId);
+    let rows;
+    if (hasD1(env)) {
+      const res = await env.DB.prepare('SELECT ratee_email AS rateeEmail, rating, comment FROM ratings WHERE group_id = ? AND rater_email = ?').bind(groupId, user.email).all();
+      rows = res.results || [];
+    } else {
+      rows = [...memory.ratings.values()].filter(r => r.groupId === groupId && r.raterEmail === user.email);
+    }
+    const ratings = rows.map(r => {
+      const member = members.find(m => m.email === r.rateeEmail);
+      return { rateeRegistrationId: member?.registrationId || null, rating: r.rating, comment: r.comment };
+    });
+    return json({ ratings }, 200, request, env);
+  }
+
   return json({ error: 'Not found' }, 404, request, env);
 }
+
+export const __test = {
+  seedMatchGroup(env, { groupId, restaurant, eventAt, eventEndsAt, members }) {
+    const now = nowIso();
+    memory.matchGroups.set(groupId, {
+      id: groupId, status: 'matched', memberCount: members.length, algorithmVersion: 'test',
+      restaurantJson: JSON.stringify(restaurant), eventAt, eventEndsAt, createdAt: now, updatedAt: now,
+    });
+    memory.matchGroupMembers.set(groupId, members.map(m => ({
+      groupId, email: m.email, registrationId: m.registrationId, attendanceStatus: 'unknown', createdAt: now,
+    })));
+    for (const m of members) {
+      const reg = memory.registrations.get(m.email);
+      if (reg) { reg.status = 'matched'; reg.matchedGroupId = groupId; }
+    }
+  },
+};
 
 export default { fetch: handle };
 export { handle as fetch };

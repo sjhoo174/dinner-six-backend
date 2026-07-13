@@ -211,12 +211,14 @@ async function loadMatchForRegistration(env, reg) {
     eventAt,
     eventEndsAt,
     ratingWindowOpensAt,
+    dinnerType: reg.profile?.dinnerType || 'social',
     group: members.map(m => {
       const profile = typeof m.profileJson === 'string' ? JSON.parse(m.profileJson) : (m.profile || {});
       return {
         registrationId: m.registrationId,
         name: profile.name, industry: profile.industry, gender: profile.gender,
         vibe: profile.vibe, energy: profile.energy, topics: profile.topics,
+        networkingGoal: profile.networkingGoal || null,
         persona: inferPersona(profile), isUser: m.email === reg.email,
         attendanceStatus: m.attendanceStatus || 'unknown',
       };
@@ -333,6 +335,8 @@ async function handle(request, env = {}) {
     delete profile.turnstileToken;
     if (!profile.name || !profile.phone || !profile.area || !profile.budget) return json({ error: 'Name, phone number, area, and budget are required' }, 400, request, env);
     if (profile.gender && !['Male', 'Female'].includes(profile.gender)) return json({ error: 'Gender must be Male or Female' }, 400, request, env);
+    if (profile.dinnerType && !['social', 'professional'].includes(profile.dinnerType)) return json({ error: 'Dinner type must be social or professional' }, 400, request, env);
+    if (!profile.dinnerType) profile.dinnerType = 'social';
 
     const existing = await getRegistration(env, user.email);
     if (existing) {

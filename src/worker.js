@@ -175,7 +175,7 @@ async function getMatchGroupMembers(env, groupId) {
   if (hasD1(env)) {
     const res = await env.DB.prepare(`
       SELECT mgm.group_id AS groupId, mgm.email AS email, mgm.registration_id AS registrationId,
-             mgm.attendance_status AS attendanceStatus, r.profile_json AS profileJson
+             mgm.attendance_status AS attendanceStatus, r.profile_json AS profileJson, r.status AS registrationStatus
       FROM match_group_members mgm
       JOIN registrations r ON r.id = mgm.registration_id
       WHERE mgm.group_id = ?
@@ -185,7 +185,7 @@ async function getMatchGroupMembers(env, groupId) {
   const members = memory.matchGroupMembers.get(groupId) || [];
   return members.map(m => {
     const reg = memory.registrations.get(m.email);
-    return { ...m, profileJson: reg ? JSON.stringify(reg.profile) : '{}' };
+    return { ...m, profileJson: reg ? JSON.stringify(reg.profile) : '{}', registrationStatus: reg?.status };
   });
 }
 
@@ -221,6 +221,7 @@ async function loadMatchForRegistration(env, reg) {
         networkingGoal: profile.networkingGoal || null,
         persona: inferPersona(profile), isUser: m.email === reg.email,
         attendanceStatus: m.attendanceStatus || 'unknown',
+        confirmed: m.registrationStatus === 'confirmed',
       };
     }),
   };

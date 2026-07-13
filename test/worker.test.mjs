@@ -147,6 +147,8 @@ if (meMatched.registration.status !== 'matched') throw new Error('seeded match s
 if (!meMatched.registration.match || meMatched.registration.match.restaurant.area !== 'East') throw new Error('match/status did not resolve as expected from seeded group');
 if (meMatched.registration.match.compatibility != null) throw new Error('real matches should not carry a fabricated compatibility score');
 if (!meMatched.registration.match.eventAt || !meMatched.registration.match.ratingWindowOpensAt) throw new Error('match should expose eventAt/ratingWindowOpensAt');
+const adaEntryBeforeConfirm = meMatched.registration.match.group.find(p => p.isUser);
+if (adaEntryBeforeConfirm.confirmed !== false) throw new Error('member should not show as confirmed before confirming');
 
 // Still can't register again while matched but not yet confirmed/rejected.
 const duplicateWhileMatched = await jsonExpectError('/registrations', { method: 'POST', headers: authHeader(token), body: profile });
@@ -158,6 +160,13 @@ if (attendanceBeforeConfirm.status !== 400) throw new Error('attendance should b
 
 const confirmed = await json('/match/confirm', { method: 'POST', headers: authHeader(token), body: { registrationId: created.registration.id } });
 if (!confirmed.success || confirmed.registration.status !== 'confirmed') throw new Error('confirm failed');
+
+// Other members' confirmation status stays visible to the caller even after the caller has confirmed.
+const meAfterConfirm = await json('/me', { headers: authHeader(token) });
+const adaEntryAfterConfirm = meAfterConfirm.registration.match.group.find(p => p.isUser);
+const boEntry = meAfterConfirm.registration.match.group.find(p => !p.isUser);
+if (adaEntryAfterConfirm.confirmed !== true) throw new Error('the caller should show as confirmed after confirming');
+if (boEntry.confirmed !== false) throw new Error('a tablemate who never confirmed should still show as not confirmed');
 
 // Attendance: since eventAt is already in the past for this seeded group, setting it should be rejected
 // (now for the "event already started" reason rather than "not confirmed yet").

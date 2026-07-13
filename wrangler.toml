@@ -18,7 +18,7 @@ compatibility_date = "2026-06-28"
 [[d1_databases]]
 binding = "DB"
 database_name = "dinner-six-db"
-database_id = "ccaa1305-2553-4197-99d8-04c8b36c804f"
+database_id = "7598b60f-3750-4877-b746-4ed149dc9945"
 
 [vars]
 FRONTEND_URL = "https://dinner-six.shijanhoo.workers.dev"

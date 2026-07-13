@@ -121,6 +121,7 @@ function parseRegistration(row) {
     match: row.match_json ? JSON.parse(row.match_json) : row.match || null,
     createdAt: row.created_at || row.createdAt, updatedAt: row.updated_at || row.updatedAt,
     matchAt: row.match_at || row.matchAt, confirmedAt: row.confirmed_at || row.confirmedAt || null,
+    rejectedAt: row.rejected_at || row.rejectedAt || null,
     matchedGroupId: row.matched_group_id ?? row.matchedGroupId ?? null,
   };
 }
@@ -131,10 +132,10 @@ async function getRegistration(env, email) {
 async function saveRegistration(env, reg) {
   reg.updatedAt = nowIso();
   if (hasD1(env)) {
-    await env.DB.prepare(`INSERT INTO registrations (id, email, status, profile_json, match_json, created_at, updated_at, match_at, confirmed_at, matched_group_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET status = excluded.status, profile_json = excluded.profile_json, match_json = excluded.match_json, updated_at = excluded.updated_at, match_at = excluded.match_at, confirmed_at = excluded.confirmed_at, matched_group_id = excluded.matched_group_id`)
-      .bind(reg.id, reg.email, reg.status, JSON.stringify(reg.profile), reg.match ? JSON.stringify(reg.match) : null, reg.createdAt, reg.updatedAt, reg.matchAt, reg.confirmedAt || null, reg.matchedGroupId || null).run();
+    await env.DB.prepare(`INSERT INTO registrations (id, email, status, profile_json, match_json, created_at, updated_at, match_at, confirmed_at, rejected_at, matched_group_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET status = excluded.status, profile_json = excluded.profile_json, match_json = excluded.match_json, updated_at = excluded.updated_at, match_at = excluded.match_at, confirmed_at = excluded.confirmed_at, rejected_at = excluded.rejected_at, matched_group_id = excluded.matched_group_id`)
+      .bind(reg.id, reg.email, reg.status, JSON.stringify(reg.profile), reg.match ? JSON.stringify(reg.match) : null, reg.createdAt, reg.updatedAt, reg.matchAt, reg.confirmedAt || null, reg.rejectedAt || null, reg.matchedGroupId || null).run();
   } else memory.registrations.set(reg.email, reg);
   return reg;
 }
@@ -332,8 +333,23 @@ async function handle(request, env = {}) {
     delete profile.turnstileToken;
     if (!profile.name || !profile.phone || !profile.area || !profile.budget) return json({ error: 'Name, phone number, area, and budget are required' }, 400, request, env);
     if (profile.gender && !['Male', 'Female'].includes(profile.gender)) return json({ error: 'Gender must be Male or Female' }, 400, request, env);
+
+    const existing = await getRegistration(env, user.email);
+    if (existing) {
+      if (['pending', 'matched', 'confirmed'].includes(existing.status)) {
+        return json({ error: 'You already have an active registration. Confirm or reject your current table before registering again.' }, 400, request, env);
+      }
+      if (existing.status === 'rejected' && existing.rejectedAt) {
+        const cooldownMs = Number(env.REJECT_COOLDOWN_HOURS || 6) * 3600000;
+        const retryAt = new Date(existing.rejectedAt).getTime() + cooldownMs;
+        if (Date.now() < retryAt) {
+          return json({ error: 'You can register again 6 hours after rejecting a table.', retryAt: new Date(retryAt).toISOString() }, 400, request, env);
+        }
+      }
+    }
+
     const created = Date.now();
-    const registration = { id: crypto.randomUUID(), email: user.email, status: 'pending', profile, match: null, createdAt: nowIso(), updatedAt: nowIso(), matchAt: created + waitMs(profile, env), confirmedAt: null, matchedGroupId: null };
+    const registration = { id: crypto.randomUUID(), email: user.email, status: 'pending', profile, match: null, createdAt: nowIso(), updatedAt: nowIso(), matchAt: created + waitMs(profile, env), confirmedAt: null, rejectedAt: null, matchedGroupId: null };
     await saveRegistration(env, registration);
     return json({ registration }, 200, request, env);
   }
@@ -357,14 +373,35 @@ async function handle(request, env = {}) {
     return json({ success: true, registration, match: registration.match }, 200, request, env);
   }
 
+  if (path === '/match/reject' && request.method === 'POST') {
+    const body = await request.json().catch(() => ({}));
+    const registration = await currentRegistration(user.email, env);
+    if (!registration || registration.id !== body.registrationId) return json({ error: 'Registration not found' }, 404, request, env);
+    if (registration.status !== 'matched') return json({ error: 'Only a pending match offer can be rejected' }, 400, request, env);
+    const groupId = registration.matchedGroupId;
+    if (hasD1(env)) {
+      await env.DB.prepare('DELETE FROM match_group_members WHERE group_id = ? AND email = ?').bind(groupId, user.email).run();
+    } else {
+      const members = memory.matchGroupMembers.get(groupId) || [];
+      memory.matchGroupMembers.set(groupId, members.filter(m => m.email !== user.email));
+    }
+    registration.status = 'rejected';
+    registration.rejectedAt = nowIso();
+    registration.matchedGroupId = null;
+    registration.match = null;
+    await saveRegistration(env, registration);
+    return json({ success: true, registration }, 200, request, env);
+  }
+
   if (path === '/attendance' && request.method === 'POST') {
     const body = await request.json().catch(() => ({}));
     const allowedStatus = ['on_time', 'late', 'not_showing'];
     if (!allowedStatus.includes(body.status)) return json({ error: 'status must be one of on_time, late, not_showing' }, 400, request, env);
+    const registration = await getRegistration(env, user.email);
+    if (!registration || registration.matchedGroupId !== body.groupId) return json({ error: 'Not a member of this group' }, 404, request, env);
+    if (registration.status !== 'confirmed') return json({ error: 'Confirm your spot before setting attendance' }, 400, request, env);
     const group = await getMatchGroup(env, body.groupId);
     if (!group) return json({ error: 'Match group not found' }, 404, request, env);
-    const membership = await findMembership(env, body.groupId, user.email);
-    if (!membership) return json({ error: 'Not a member of this group' }, 404, request, env);
     const eventAt = group.event_at || group.eventAt;
     if (eventAt && Date.now() >= new Date(eventAt).getTime()) return json({ error: 'Attendance can only be set before the event' }, 400, request, env);
     const updatedAt = nowIso();

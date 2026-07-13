@@ -93,9 +93,8 @@ const profile = {
   vibe: 'Deep talks', energy: 'Balanced', topics: ['Food', 'AI'], area: 'East', budget: '$35-$50',
   diet: 'No restrictions', night: 'Thursday', alcohol: 'Social drinker', language: 'English', smoking: 'Non-smoker',
 };
-const created = await json('/registrations', { method: 'POST', headers: authHeader(token), body: profile });
-if (created.registration.email !== 'ada@example.com' || created.registration.profile.phone !== '+65 9123 4567' || created.registration.profile.area !== 'East') throw new Error('registration was not persisted with email/profile');
 
+// Field/gender validation, checked before ada has any registration on file.
 let missingPhoneFailed = false;
 try {
   await json('/registrations', { method: 'POST', headers: authHeader(token), body: { ...profile, phone: '' } });
@@ -104,19 +103,29 @@ try {
 }
 if (!missingPhoneFailed) throw new Error('phone number should be required');
 
+const genderRejected = await jsonExpectError('/registrations', { method: 'POST', headers: authHeader(token), body: { ...profile, gender: 'Non-binary' } });
+if (genderRejected.status !== 400) throw new Error('gender outside Male/Female should be rejected with 400');
+
+const created = await json('/registrations', { method: 'POST', headers: authHeader(token), body: profile });
+if (created.registration.email !== 'ada@example.com' || created.registration.profile.phone !== '+65 9123 4567' || created.registration.profile.area !== 'East') throw new Error('registration was not persisted with email/profile');
+
 // Matching is now async/cron-driven — registering no longer instantly produces a match.
 const meAfterRegistration = await json('/me', { headers: authHeader(token) });
 if (meAfterRegistration.registration.status !== 'pending' || meAfterRegistration.registration.match !== null) {
   throw new Error('registration should stay pending with no match until the matcher-worker cron runs');
 }
 
-// Gender is restricted to Male/Female only.
-const genderRejected = await jsonExpectError('/registrations', { method: 'POST', headers: authHeader(token), body: { ...profile, gender: 'Non-binary' } });
-if (genderRejected.status !== 400) throw new Error('gender outside Male/Female should be rejected with 400');
+// Cannot submit a second registration while one is already active (pending here).
+const duplicateWhilePending = await jsonExpectError('/registrations', { method: 'POST', headers: authHeader(token), body: profile });
+if (duplicateWhilePending.status !== 400) throw new Error('registering again while a pending registration exists should be blocked');
 
 // Confirming before a real match exists should fail, not fabricate one.
 const confirmTooEarly = await jsonExpectError('/match/confirm', { method: 'POST', headers: authHeader(token), body: { registrationId: created.registration.id } });
 if (confirmTooEarly.status !== 400) throw new Error('confirming before a real match exists should fail');
+
+// Rejecting before a real match exists should also fail — there's nothing to reject yet.
+const rejectTooEarly = await jsonExpectError('/match/reject', { method: 'POST', headers: authHeader(token), body: { registrationId: created.registration.id } });
+if (rejectTooEarly.status !== 400) throw new Error('rejecting before a real match exists should fail');
 
 // Simulate what matcher-worker would have written for this registration.
 const groupId = 'group-test-1';
@@ -139,10 +148,19 @@ if (!meMatched.registration.match || meMatched.registration.match.restaurant.are
 if (meMatched.registration.match.compatibility != null) throw new Error('real matches should not carry a fabricated compatibility score');
 if (!meMatched.registration.match.eventAt || !meMatched.registration.match.ratingWindowOpensAt) throw new Error('match should expose eventAt/ratingWindowOpensAt');
 
+// Still can't register again while matched but not yet confirmed/rejected.
+const duplicateWhileMatched = await jsonExpectError('/registrations', { method: 'POST', headers: authHeader(token), body: profile });
+if (duplicateWhileMatched.status !== 400) throw new Error('registering again while matched (not confirmed/rejected) should be blocked');
+
+// Attendance cannot be set until the match is confirmed.
+const attendanceBeforeConfirm = await jsonExpectError('/attendance', { method: 'POST', headers: authHeader(token), body: { groupId, status: 'on_time' } });
+if (attendanceBeforeConfirm.status !== 400) throw new Error('attendance should be rejected before the match is confirmed');
+
 const confirmed = await json('/match/confirm', { method: 'POST', headers: authHeader(token), body: { registrationId: created.registration.id } });
 if (!confirmed.success || confirmed.registration.status !== 'confirmed') throw new Error('confirm failed');
 
-// Attendance: since eventAt is already in the past for this seeded group, setting it should be rejected.
+// Attendance: since eventAt is already in the past for this seeded group, setting it should be rejected
+// (now for the "event already started" reason rather than "not confirmed yet").
 const attendanceTooLate = await jsonExpectError('/attendance', { method: 'POST', headers: authHeader(token), body: { groupId, status: 'on_time' } });
 if (attendanceTooLate.status !== 400) throw new Error('attendance should be rejected once the event has started');
 
@@ -176,4 +194,41 @@ __test.seedMatchGroup(env, {
 const ratingTooEarly = await jsonExpectError('/ratings', { method: 'POST', headers: authHeader(token), body: { groupId: futureGroupId, rateeRegistrationId: 'reg-dee', rating: 4 } });
 if (ratingTooEarly.status !== 400) throw new Error('rating before the eligibility window should be rejected');
 
-console.log('backend Google OAuth + relational registration + match/attendance/rating flow passed');
+// --- Reject flow (separate user so it doesn't disturb ada's confirmed state above) ---
+
+const ellenToken = await signInAs('ellen@example.com', 'Ellen Test');
+const ellenProfile = { ...profile, name: 'Ellen Tester', phone: '+65 9000 9999', area: 'West' };
+const ellenReg = await json('/registrations', { method: 'POST', headers: authHeader(ellenToken), body: ellenProfile });
+
+const ellenRejectWhilePending = await jsonExpectError('/match/reject', { method: 'POST', headers: authHeader(ellenToken), body: { registrationId: ellenReg.registration.id } });
+if (ellenRejectWhilePending.status !== 400) throw new Error('rejecting while only pending (no match yet) should fail');
+
+const ellenGroupId = 'group-test-ellen';
+__test.seedMatchGroup(env, {
+  groupId: ellenGroupId,
+  restaurant: { id: 'r4', name: 'Westside Noodle Room', area: 'West', cuisine: 'Modern noodles and small plates', perk: 'Dessert platter for the table' },
+  eventAt: new Date(Date.now() + 3 * 86400000).toISOString(),
+  eventEndsAt: new Date(Date.now() + 3 * 86400000 + 2 * 3600000).toISOString(),
+  members: [
+    { email: 'ellen@example.com', registrationId: ellenReg.registration.id },
+    { email: 'frank@example.com', registrationId: 'reg-frank' },
+  ],
+});
+
+const rejected = await json('/match/reject', { method: 'POST', headers: authHeader(ellenToken), body: { registrationId: ellenReg.registration.id } });
+if (!rejected.success || rejected.registration.status !== 'rejected' || rejected.registration.matchedGroupId) {
+  throw new Error('reject should flip status to rejected and clear matchedGroupId');
+}
+
+const ellenAttendanceAfterReject = await jsonExpectError('/attendance', { method: 'POST', headers: authHeader(ellenToken), body: { groupId: ellenGroupId, status: 'on_time' } });
+if (ellenAttendanceAfterReject.status !== 404) throw new Error('attendance for a rejected/left group should 404');
+
+const rejectAgain = await jsonExpectError('/match/reject', { method: 'POST', headers: authHeader(ellenToken), body: { registrationId: ellenReg.registration.id } });
+if (rejectAgain.status !== 400) throw new Error('rejecting an already-rejected registration should fail');
+
+const registerDuringCooldown = await jsonExpectError('/registrations', { method: 'POST', headers: authHeader(ellenToken), body: ellenProfile });
+if (registerDuringCooldown.status !== 400 || !registerDuringCooldown.data.retryAt) {
+  throw new Error('registering during the post-reject cooldown should be blocked and report a retryAt');
+}
+
+console.log('backend Google OAuth + relational registration + match/attendance/rating/reject flow passed');

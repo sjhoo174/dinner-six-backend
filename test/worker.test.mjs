@@ -111,13 +111,33 @@ if (created.registration.email !== 'ada@example.com' || created.registration.pro
 
 // Matching is now async/cron-driven — registering no longer instantly produces a match.
 const meAfterRegistration = await json('/me', { headers: authHeader(token) });
-if (meAfterRegistration.registration.status !== 'pending' || meAfterRegistration.registration.match !== null) {
+if (meAfterRegistration.registrations.social.status !== 'pending' || meAfterRegistration.registrations.social.match !== null) {
   throw new Error('registration should stay pending with no match until the matcher-worker cron runs');
 }
+if (meAfterRegistration.registrations.professional !== null) throw new Error('the professional track should be untouched by a social registration');
 
 // Cannot submit a second registration while one is already active (pending here).
 const duplicateWhilePending = await jsonExpectError('/registrations', { method: 'POST', headers: authHeader(token), body: profile });
 if (duplicateWhilePending.status !== 400) throw new Error('registering again while a pending registration exists should be blocked');
+
+// But registering for the OTHER dinner type concurrently should succeed — mutually
+// exclusive within a type, independent across types.
+const adaProfessionalProfile = { ...profile, dinnerType: 'professional', networkingGoal: 'Find co-founders' };
+const adaProfessional = await json('/registrations', { method: 'POST', headers: authHeader(token), body: adaProfessionalProfile });
+if (adaProfessional.registration.email !== 'ada@example.com' || adaProfessional.registration.profile.dinnerType !== 'professional') {
+  throw new Error('registering for a different dinner type while one type is active should succeed');
+}
+
+const meBothTracks = await json('/me', { headers: authHeader(token) });
+if (meBothTracks.registrations.social.status !== 'pending' || meBothTracks.registrations.professional.status !== 'pending') {
+  throw new Error('both dinner-type tracks should be independently visible via /me at the same time');
+}
+if (meBothTracks.registrations.social.id === meBothTracks.registrations.professional.id) {
+  throw new Error('the two tracks should be genuinely separate registration rows');
+}
+
+const duplicateProfessional = await jsonExpectError('/registrations', { method: 'POST', headers: authHeader(token), body: adaProfessionalProfile });
+if (duplicateProfessional.status !== 400) throw new Error('registering again for the same already-active dinner type should still be blocked');
 
 // Confirming before a real match exists should fail, not fabricate one.
 const confirmTooEarly = await jsonExpectError('/match/confirm', { method: 'POST', headers: authHeader(token), body: { registrationId: created.registration.id } });
@@ -143,11 +163,12 @@ __test.seedMatchGroup(env, {
 });
 
 const meMatched = await json('/me', { headers: authHeader(token) });
-if (meMatched.registration.status !== 'matched') throw new Error('seeded match should surface as matched');
-if (!meMatched.registration.match || meMatched.registration.match.restaurant.area !== 'East') throw new Error('match/status did not resolve as expected from seeded group');
-if (meMatched.registration.match.compatibility != null) throw new Error('real matches should not carry a fabricated compatibility score');
-if (!meMatched.registration.match.eventAt || !meMatched.registration.match.ratingWindowOpensAt) throw new Error('match should expose eventAt/ratingWindowOpensAt');
-const adaEntryBeforeConfirm = meMatched.registration.match.group.find(p => p.isUser);
+if (meMatched.registrations.social.status !== 'matched') throw new Error('seeded match should surface as matched');
+if (!meMatched.registrations.social.match || meMatched.registrations.social.match.restaurant.area !== 'East') throw new Error('match/status did not resolve as expected from seeded group');
+if (meMatched.registrations.social.match.compatibility != null) throw new Error('real matches should not carry a fabricated compatibility score');
+if (!meMatched.registrations.social.match.eventAt || !meMatched.registrations.social.match.ratingWindowOpensAt) throw new Error('match should expose eventAt/ratingWindowOpensAt');
+if (meMatched.registrations.professional.status !== 'pending') throw new Error('the professional track should be unaffected by the social match');
+const adaEntryBeforeConfirm = meMatched.registrations.social.match.group.find(p => p.isUser);
 if (adaEntryBeforeConfirm.confirmed !== false) throw new Error('member should not show as confirmed before confirming');
 
 // Still can't register again while matched but not yet confirmed/rejected.
@@ -163,8 +184,8 @@ if (!confirmed.success || confirmed.registration.status !== 'confirmed') throw n
 
 // Other members' confirmation status stays visible to the caller even after the caller has confirmed.
 const meAfterConfirm = await json('/me', { headers: authHeader(token) });
-const adaEntryAfterConfirm = meAfterConfirm.registration.match.group.find(p => p.isUser);
-const boEntry = meAfterConfirm.registration.match.group.find(p => !p.isUser);
+const adaEntryAfterConfirm = meAfterConfirm.registrations.social.match.group.find(p => p.isUser);
+const boEntry = meAfterConfirm.registrations.social.match.group.find(p => !p.isUser);
 if (adaEntryAfterConfirm.confirmed !== true) throw new Error('the caller should show as confirmed after confirming');
 if (boEntry.confirmed !== false) throw new Error('a tablemate who never confirmed should still show as not confirmed');
 
@@ -240,4 +261,23 @@ if (registerDuringCooldown.status !== 400 || !registerDuringCooldown.data.retryA
   throw new Error('registering during the post-reject cooldown should be blocked and report a retryAt');
 }
 
-console.log('backend Google OAuth + relational registration + match/attendance/rating/reject flow passed');
+// --- Admin reset endpoint (must run last — it wipes all state including sessions) ---
+
+const resetWithoutKeyConfigured = await jsonExpectError('/admin/reset', { method: 'POST', headers: { 'X-Admin-Key': 'whatever' } });
+if (resetWithoutKeyConfigured.status !== 404) throw new Error('admin reset should 404 when ADMIN_API_KEY is not configured');
+
+const adminEnv = { ...env, ADMIN_API_KEY: 'test-admin-key' };
+
+const resetWrongKey = await jsonExpectError('/admin/reset', { method: 'POST', headers: { 'X-Admin-Key': 'nope' } }, adminEnv);
+if (resetWrongKey.status !== 404) throw new Error('admin reset should 404 with the wrong key (same as not-found, not a distinguishable 403)');
+
+const resetMissingHeader = await jsonExpectError('/admin/reset', { method: 'POST' }, adminEnv);
+if (resetMissingHeader.status !== 404) throw new Error('admin reset should 404 with no X-Admin-Key header at all');
+
+const resetOk = await json('/admin/reset', { method: 'POST', headers: { 'X-Admin-Key': 'test-admin-key' } }, adminEnv);
+if (!resetOk.success) throw new Error('admin reset should succeed with the correct key');
+
+const meAfterReset = await jsonExpectError('/me', { headers: authHeader(token) }, adminEnv);
+if (meAfterReset.status !== 401) throw new Error('sessions should be cleared after admin reset, so the old token is no longer valid');
+
+console.log('backend Google OAuth + relational registration + match/attendance/rating/reject/admin-reset flow passed');

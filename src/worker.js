@@ -123,20 +123,37 @@ function parseRegistration(row) {
     matchAt: row.match_at || row.matchAt, confirmedAt: row.confirmed_at || row.confirmedAt || null,
     rejectedAt: row.rejected_at || row.rejectedAt || null,
     matchedGroupId: row.matched_group_id ?? row.matchedGroupId ?? null,
+    dinnerType: row.dinner_type || row.dinnerType || 'social',
   };
 }
-async function getRegistration(env, email) {
-  if (hasD1(env)) return parseRegistration(await env.DB.prepare('SELECT * FROM registrations WHERE email = ? ORDER BY created_at DESC LIMIT 1').bind(email).first());
-  return memory.registrations.get(email) || null;
+function memoryRegKey(email, dinnerType) { return `${email}:${dinnerType}`; }
+// Each user can have one active registration per dinner type at a time —
+// mutually exclusive within a type, independent across types — so lookups
+// are always scoped by (email, dinnerType).
+async function getRegistration(env, email, dinnerType) {
+  if (hasD1(env)) return parseRegistration(await env.DB.prepare('SELECT * FROM registrations WHERE email = ? AND dinner_type = ? ORDER BY created_at DESC LIMIT 1').bind(email, dinnerType).first());
+  return memory.registrations.get(memoryRegKey(email, dinnerType)) || null;
+}
+async function getRegistrationById(env, id) {
+  if (!id) return null;
+  if (hasD1(env)) return parseRegistration(await env.DB.prepare('SELECT * FROM registrations WHERE id = ?').bind(id).first());
+  for (const reg of memory.registrations.values()) if (reg.id === id) return reg;
+  return null;
+}
+async function getRegistrationInGroup(env, email, groupId) {
+  if (!groupId) return null;
+  if (hasD1(env)) return parseRegistration(await env.DB.prepare('SELECT * FROM registrations WHERE email = ? AND matched_group_id = ?').bind(email, groupId).first());
+  for (const reg of memory.registrations.values()) if (reg.email === email && reg.matchedGroupId === groupId) return reg;
+  return null;
 }
 async function saveRegistration(env, reg) {
   reg.updatedAt = nowIso();
   if (hasD1(env)) {
-    await env.DB.prepare(`INSERT INTO registrations (id, email, status, profile_json, match_json, created_at, updated_at, match_at, confirmed_at, rejected_at, matched_group_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET status = excluded.status, profile_json = excluded.profile_json, match_json = excluded.match_json, updated_at = excluded.updated_at, match_at = excluded.match_at, confirmed_at = excluded.confirmed_at, rejected_at = excluded.rejected_at, matched_group_id = excluded.matched_group_id`)
-      .bind(reg.id, reg.email, reg.status, JSON.stringify(reg.profile), reg.match ? JSON.stringify(reg.match) : null, reg.createdAt, reg.updatedAt, reg.matchAt, reg.confirmedAt || null, reg.rejectedAt || null, reg.matchedGroupId || null).run();
-  } else memory.registrations.set(reg.email, reg);
+    await env.DB.prepare(`INSERT INTO registrations (id, email, status, profile_json, match_json, created_at, updated_at, match_at, confirmed_at, rejected_at, matched_group_id, dinner_type)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET status = excluded.status, profile_json = excluded.profile_json, match_json = excluded.match_json, updated_at = excluded.updated_at, match_at = excluded.match_at, confirmed_at = excluded.confirmed_at, rejected_at = excluded.rejected_at, matched_group_id = excluded.matched_group_id, dinner_type = excluded.dinner_type`)
+      .bind(reg.id, reg.email, reg.status, JSON.stringify(reg.profile), reg.match ? JSON.stringify(reg.match) : null, reg.createdAt, reg.updatedAt, reg.matchAt, reg.confirmedAt || null, reg.rejectedAt || null, reg.matchedGroupId || null, reg.dinnerType || 'social').run();
+  } else memory.registrations.set(memoryRegKey(reg.email, reg.dinnerType || 'social'), reg);
   return reg;
 }
 
@@ -184,7 +201,8 @@ async function getMatchGroupMembers(env, groupId) {
   }
   const members = memory.matchGroupMembers.get(groupId) || [];
   return members.map(m => {
-    const reg = memory.registrations.get(m.email);
+    let reg = null;
+    for (const candidate of memory.registrations.values()) if (candidate.id === m.registrationId) { reg = candidate; break; }
     return { ...m, profileJson: reg ? JSON.stringify(reg.profile) : '{}', registrationStatus: reg?.status };
   });
 }
@@ -236,15 +254,19 @@ function waitMs(profile, env) {
   for (let i = 0; i < seed.length; i += 1) hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
   return min + (hash % Math.max(1, max - min));
 }
-async function currentRegistration(email, env) {
-  const reg = await getRegistration(env, email);
-  if (!reg) return null;
+async function attachMatch(env, reg) {
+  if (!reg) return reg;
   if (reg.matchedGroupId && (reg.status === 'matched' || reg.status === 'confirmed')) {
     reg.match = await loadMatchForRegistration(env, reg);
   } else {
     reg.match = null;
   }
   return reg;
+}
+async function currentRegistration(email, dinnerType, env) {
+  const reg = await getRegistration(env, email, dinnerType);
+  if (!reg) return null;
+  return attachMatch(env, reg);
 }
 
 async function verifyTurnstile(token, remoteIp, env) {
@@ -291,6 +313,32 @@ async function handle(request, env = {}) {
   if (path === '/health') return json({ ok: true, storage: hasD1(env) ? 'd1' : 'memory', captchaEnabled: Boolean(env.TURNSTILE_SECRET_KEY) }, 200, request, env);
   if (path === '/restaurants' && request.method === 'GET') return json({ restaurants: await getRestaurants(env) }, 200, request, env);
 
+  if (path === '/admin/reset' && request.method === 'POST') {
+    if (!env.ADMIN_API_KEY || request.headers.get('X-Admin-Key') !== env.ADMIN_API_KEY) {
+      return json({ error: 'Not found' }, 404, request, env);
+    }
+    if (hasD1(env)) {
+      await env.DB.batch([
+        env.DB.prepare('DELETE FROM ratings'),
+        env.DB.prepare('DELETE FROM match_group_members'),
+        env.DB.prepare('DELETE FROM match_groups'),
+        env.DB.prepare('DELETE FROM registrations'),
+        env.DB.prepare('DELETE FROM sessions'),
+        env.DB.prepare('DELETE FROM oauth_states'),
+        env.DB.prepare('DELETE FROM users'),
+      ]);
+    } else {
+      memory.ratings.clear();
+      memory.matchGroupMembers.clear();
+      memory.matchGroups.clear();
+      memory.registrations.clear();
+      memory.sessions.clear();
+      memory.oauthStates.clear();
+      memory.users.clear();
+    }
+    return json({ success: true, storage: hasD1(env) ? 'd1' : 'memory' }, 200, request, env);
+  }
+
   if (path === '/auth/google/start' && request.method === 'GET') {
     if (!env.GOOGLE_CLIENT_ID) return json({ error: 'GOOGLE_CLIENT_ID is not configured' }, 500, request, env);
     const returnTo = safeReturnTo(url.searchParams.get('return_to'), env);
@@ -325,8 +373,17 @@ async function handle(request, env = {}) {
   const user = await requireUser(request, env);
   if (!user) return json({ error: 'Sign in required' }, 401, request, env);
 
-  if (path === '/me' && request.method === 'GET') return json({ user: { email: user.email, name: user.name }, registration: await currentRegistration(user.email, env) }, 200, request, env);
-  if (path === '/registrations/current' && request.method === 'GET') return json({ registration: await currentRegistration(user.email, env) }, 200, request, env);
+  if (path === '/me' && request.method === 'GET') {
+    const [social, professional] = await Promise.all([
+      currentRegistration(user.email, 'social', env),
+      currentRegistration(user.email, 'professional', env),
+    ]);
+    return json({ user: { email: user.email, name: user.name }, registrations: { social, professional } }, 200, request, env);
+  }
+  if (path === '/registrations/current' && request.method === 'GET') {
+    const dinnerType = url.searchParams.get('dinnerType') === 'professional' ? 'professional' : 'social';
+    return json({ registration: await currentRegistration(user.email, dinnerType, env) }, 200, request, env);
+  }
 
   if (path === '/registrations' && request.method === 'POST') {
     const profile = await request.json().catch(() => ({}));
@@ -339,10 +396,13 @@ async function handle(request, env = {}) {
     if (profile.dinnerType && !['social', 'professional'].includes(profile.dinnerType)) return json({ error: 'Dinner type must be social or professional' }, 400, request, env);
     if (!profile.dinnerType) profile.dinnerType = 'social';
 
-    const existing = await getRegistration(env, user.email);
+    // Mutually exclusive within a dinner type, independent across types — a
+    // user can have one active social AND one active professional
+    // registration at the same time.
+    const existing = await getRegistration(env, user.email, profile.dinnerType);
     if (existing) {
       if (['pending', 'matched', 'confirmed'].includes(existing.status)) {
-        return json({ error: 'You already have an active registration. Confirm or reject your current table before registering again.' }, 400, request, env);
+        return json({ error: 'You already have an active registration for this dinner type. Confirm or reject your current table before registering again.' }, 400, request, env);
       }
       if (existing.status === 'rejected' && existing.rejectedAt) {
         const cooldownMs = Number(env.REJECT_COOLDOWN_HOURS || 6) * 3600000;
@@ -354,22 +414,28 @@ async function handle(request, env = {}) {
     }
 
     const created = Date.now();
-    const registration = { id: crypto.randomUUID(), email: user.email, status: 'pending', profile, match: null, createdAt: nowIso(), updatedAt: nowIso(), matchAt: created + waitMs(profile, env), confirmedAt: null, rejectedAt: null, matchedGroupId: null };
+    const registration = {
+      id: crypto.randomUUID(), email: user.email, status: 'pending', profile, match: null,
+      createdAt: nowIso(), updatedAt: nowIso(), matchAt: created + waitMs(profile, env),
+      confirmedAt: null, rejectedAt: null, matchedGroupId: null, dinnerType: profile.dinnerType,
+    };
     await saveRegistration(env, registration);
     return json({ registration }, 200, request, env);
   }
 
   const statusMatch = path.match(/^\/registrations\/([^/]+)\/status$/);
   if (statusMatch && request.method === 'GET') {
-    const registration = await currentRegistration(user.email, env);
-    if (!registration || registration.id !== statusMatch[1]) return json({ error: 'Registration not found' }, 404, request, env);
+    const registration = await getRegistrationById(env, statusMatch[1]);
+    if (!registration || registration.email !== user.email) return json({ error: 'Registration not found' }, 404, request, env);
+    await attachMatch(env, registration);
     return json({ registration }, 200, request, env);
   }
 
   if (path === '/match/confirm' && request.method === 'POST') {
     const body = await request.json().catch(() => ({}));
-    const registration = await currentRegistration(user.email, env);
-    if (!registration || registration.id !== body.registrationId) return json({ error: 'Registration not found' }, 404, request, env);
+    const registration = await getRegistrationById(env, body.registrationId);
+    if (!registration || registration.email !== user.email) return json({ error: 'Registration not found' }, 404, request, env);
+    await attachMatch(env, registration);
     if (registration.status !== 'matched' && registration.status !== 'confirmed') return json({ error: 'Match is not ready yet' }, 400, request, env);
     if (!registration.match) return json({ error: 'Match is not ready yet' }, 400, request, env);
     registration.status = 'confirmed';
@@ -380,8 +446,8 @@ async function handle(request, env = {}) {
 
   if (path === '/match/reject' && request.method === 'POST') {
     const body = await request.json().catch(() => ({}));
-    const registration = await currentRegistration(user.email, env);
-    if (!registration || registration.id !== body.registrationId) return json({ error: 'Registration not found' }, 404, request, env);
+    const registration = await getRegistrationById(env, body.registrationId);
+    if (!registration || registration.email !== user.email) return json({ error: 'Registration not found' }, 404, request, env);
     if (registration.status !== 'matched') return json({ error: 'Only a pending match offer can be rejected' }, 400, request, env);
     const groupId = registration.matchedGroupId;
     if (hasD1(env)) {
@@ -402,8 +468,8 @@ async function handle(request, env = {}) {
     const body = await request.json().catch(() => ({}));
     const allowedStatus = ['on_time', 'late', 'not_showing'];
     if (!allowedStatus.includes(body.status)) return json({ error: 'status must be one of on_time, late, not_showing' }, 400, request, env);
-    const registration = await getRegistration(env, user.email);
-    if (!registration || registration.matchedGroupId !== body.groupId) return json({ error: 'Not a member of this group' }, 404, request, env);
+    const registration = await getRegistrationInGroup(env, user.email, body.groupId);
+    if (!registration) return json({ error: 'Not a member of this group' }, 404, request, env);
     if (registration.status !== 'confirmed') return json({ error: 'Confirm your spot before setting attendance' }, 400, request, env);
     const group = await getMatchGroup(env, body.groupId);
     if (!group) return json({ error: 'Match group not found' }, 404, request, env);
@@ -481,7 +547,10 @@ export const __test = {
       groupId, email: m.email, registrationId: m.registrationId, attendanceStatus: 'unknown', createdAt: now,
     })));
     for (const m of members) {
-      const reg = memory.registrations.get(m.email);
+      let reg = null;
+      for (const candidate of memory.registrations.values()) {
+        if (candidate.id === m.registrationId || candidate.email === m.email) { reg = candidate; break; }
+      }
       if (reg) { reg.status = 'matched'; reg.matchedGroupId = groupId; }
     }
   },

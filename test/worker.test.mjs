@@ -261,6 +261,58 @@ if (registerDuringCooldown.status !== 400 || !registerDuringCooldown.data.retryA
   throw new Error('registering during the post-reject cooldown should be blocked and report a retryAt');
 }
 
+// --- Immediate unmatch when the not_showing threshold is crossed via /attendance ---
+// (should not need to wait for the matcher-worker's cron cycle)
+
+const ginaToken = await signInAs('gina@example.com', 'Gina Test');
+const hugoToken = await signInAs('hugo@example.com', 'Hugo Test');
+const irisToken = await signInAs('iris@example.com', 'Iris Test');
+
+const ginaProfile = { ...profile, name: 'Gina Tester', phone: '+65 9000 1111', area: 'North' };
+const hugoProfile = { ...profile, name: 'Hugo Tester', phone: '+65 9000 2222', area: 'North' };
+const irisProfile = { ...profile, name: 'Iris Tester', phone: '+65 9000 3333', area: 'North' };
+
+const ginaReg = await json('/registrations', { method: 'POST', headers: authHeader(ginaToken), body: ginaProfile });
+const hugoReg = await json('/registrations', { method: 'POST', headers: authHeader(hugoToken), body: hugoProfile });
+const irisReg = await json('/registrations', { method: 'POST', headers: authHeader(irisToken), body: irisProfile });
+
+const immediateGroupId = 'group-test-immediate-unmatch';
+__test.seedMatchGroup(env, {
+  groupId: immediateGroupId,
+  restaurant: { id: 'r5', name: 'North Garden Social', area: 'North', cuisine: 'Casual garden bistro', perk: 'Free zero-proof welcome spritz' },
+  eventAt: new Date(Date.now() + 4 * 86400000).toISOString(),
+  eventEndsAt: new Date(Date.now() + 4 * 86400000 + 2 * 3600000).toISOString(),
+  members: [
+    { email: 'gina@example.com', registrationId: ginaReg.registration.id },
+    { email: 'hugo@example.com', registrationId: hugoReg.registration.id },
+    { email: 'iris@example.com', registrationId: irisReg.registration.id },
+    { email: 'jack@example.com', registrationId: 'reg-jack' },
+  ],
+});
+
+await json('/match/confirm', { method: 'POST', headers: authHeader(ginaToken), body: { registrationId: ginaReg.registration.id } });
+await json('/match/confirm', { method: 'POST', headers: authHeader(hugoToken), body: { registrationId: hugoReg.registration.id } });
+await json('/match/confirm', { method: 'POST', headers: authHeader(irisToken), body: { registrationId: irisReg.registration.id } });
+
+const ginaNotShowing = await json('/attendance', { method: 'POST', headers: authHeader(ginaToken), body: { groupId: immediateGroupId, status: 'not_showing' } });
+if (ginaNotShowing.groupUnmatched !== false) throw new Error('a single not_showing should not unmatch the group yet');
+
+const hugoNotShowing = await json('/attendance', { method: 'POST', headers: authHeader(hugoToken), body: { groupId: immediateGroupId, status: 'not_showing' } });
+if (hugoNotShowing.groupUnmatched !== true) throw new Error('the 2nd not_showing should immediately unmatch the group, not wait for the cron');
+
+const ginaMeAfterUnmatch = await json('/me', { headers: authHeader(ginaToken) });
+if (ginaMeAfterUnmatch.registrations.social.status !== 'pending' || ginaMeAfterUnmatch.registrations.social.matchedGroupId) {
+  throw new Error('the member who set not_showing should be released back to pending immediately');
+}
+
+const irisMeAfterUnmatch = await json('/me', { headers: authHeader(irisToken) });
+if (irisMeAfterUnmatch.registrations.social.status !== 'pending' || irisMeAfterUnmatch.registrations.social.matchedGroupId) {
+  throw new Error('a confirmed member who never set not_showing should also be released once the group unmatches');
+}
+
+const irisAttendanceAfterUnmatch = await jsonExpectError('/attendance', { method: 'POST', headers: authHeader(irisToken), body: { groupId: immediateGroupId, status: 'on_time' } });
+if (irisAttendanceAfterUnmatch.status !== 404) throw new Error('attendance should 404 once the group has been unmatched — the registration no longer points at that group');
+
 // --- Admin reset endpoint (must run last — it wipes all state including sessions) ---
 
 const resetWithoutKeyConfigured = await jsonExpectError('/admin/reset', { method: 'POST', headers: { 'X-Admin-Key': 'whatever' } });

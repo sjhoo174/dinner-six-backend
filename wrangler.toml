@@ -34,3 +34,4 @@ MATCH_WAIT_DAYS_MIN = "2"
 MATCH_WAIT_DAYS_MAX = "4"
 RATING_WINDOW_HOURS = "3"
 REJECT_COOLDOWN_HOURS = "6"
+MAX_NOT_SHOWING = "2" # keep in sync with dinner-six-matcher-worker's MAX_NOT_SHOWING

@@ -213,6 +213,52 @@ async function findMembership(env, groupId, email) {
   return members.find(m => m.email === email) || null;
 }
 
+// Mirrors matcher-worker's shouldUnmatch/unmatchGroup: a table is no longer
+// viable once enough members won't show. The matcher-worker cron performs
+// the same check as a backstop every cycle, but we don't want a user to
+// wait up to that cadence to see their table dissolve — check and act
+// immediately whenever an attendance update could have crossed the threshold.
+async function unmatchGroupNow(env, groupId, members) {
+  const now = nowIso();
+  if (hasD1(env)) {
+    const statements = [
+      env.DB.prepare(`UPDATE match_groups SET status = 'cancelled', updated_at = ? WHERE id = ?`).bind(now, groupId),
+    ];
+    for (const m of members) {
+      statements.push(
+        env.DB.prepare(`UPDATE registrations SET status = 'pending', matched_group_id = NULL, updated_at = ?
+          WHERE id = ? AND status IN ('matched', 'confirmed')`).bind(now, m.registrationId),
+      );
+      statements.push(
+        env.DB.prepare(`UPDATE users SET match_status = 'unmatched', matched_group_id = NULL, matched_at = NULL
+          WHERE email = ?`).bind(m.email),
+      );
+    }
+    await env.DB.batch(statements);
+  } else {
+    const group = memory.matchGroups.get(groupId);
+    if (group) group.status = 'cancelled';
+    for (const m of members) {
+      let reg = null;
+      for (const candidate of memory.registrations.values()) if (candidate.id === m.registrationId) { reg = candidate; break; }
+      if (reg && (reg.status === 'matched' || reg.status === 'confirmed')) {
+        reg.status = 'pending';
+        reg.matchedGroupId = null;
+      }
+    }
+  }
+}
+async function maybeUnmatchGroup(env, groupId) {
+  const threshold = Number(env.MAX_NOT_SHOWING || 2);
+  const members = await getMatchGroupMembers(env, groupId);
+  const notShowing = members.filter(m => m.attendanceStatus === 'not_showing').length;
+  if (notShowing >= threshold) {
+    await unmatchGroupNow(env, groupId, members);
+    return true;
+  }
+  return false;
+}
+
 async function loadMatchForRegistration(env, reg) {
   if (!reg.matchedGroupId) return null;
   const group = await getMatchGroup(env, reg.matchedGroupId);
@@ -484,7 +530,11 @@ async function handle(request, env = {}) {
       const member = members.find(m => m.email === user.email);
       if (member) { member.attendanceStatus = body.status; member.attendanceUpdatedAt = updatedAt; }
     }
-    return json({ success: true, attendanceStatus: body.status }, 200, request, env);
+    let groupUnmatched = false;
+    if (body.status === 'not_showing') {
+      groupUnmatched = await maybeUnmatchGroup(env, body.groupId);
+    }
+    return json({ success: true, attendanceStatus: body.status, groupUnmatched }, 200, request, env);
   }
 
   if (path === '/ratings' && request.method === 'POST') {

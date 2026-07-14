@@ -496,18 +496,30 @@ async function handle(request, env = {}) {
     if (!registration || registration.email !== user.email) return json({ error: 'Registration not found' }, 404, request, env);
     if (registration.status !== 'matched') return json({ error: 'Only a pending match offer can be rejected' }, 400, request, env);
     const groupId = registration.matchedGroupId;
+    const updatedAt = nowIso();
+
+    // Mark this member as not showing — the same signal /attendance uses —
+    // instead of deleting their row, so declining before confirming counts
+    // toward the same >=2 unmatch threshold as declining after confirming
+    // (and the matcher-worker cron's backstop check picks it up for free,
+    // since it already counts attendance_status = 'not_showing').
     if (hasD1(env)) {
-      await env.DB.prepare('DELETE FROM match_group_members WHERE group_id = ? AND email = ?').bind(groupId, user.email).run();
+      await env.DB.prepare('UPDATE match_group_members SET attendance_status = ?, attendance_updated_at = ? WHERE group_id = ? AND email = ?')
+        .bind('not_showing', updatedAt, groupId, user.email).run();
     } else {
       const members = memory.matchGroupMembers.get(groupId) || [];
-      memory.matchGroupMembers.set(groupId, members.filter(m => m.email !== user.email));
+      const member = members.find(m => m.email === user.email);
+      if (member) { member.attendanceStatus = 'not_showing'; member.attendanceUpdatedAt = updatedAt; }
     }
+
     registration.status = 'rejected';
-    registration.rejectedAt = nowIso();
+    registration.rejectedAt = updatedAt;
     registration.matchedGroupId = null;
     registration.match = null;
     await saveRegistration(env, registration);
-    return json({ success: true, registration }, 200, request, env);
+
+    const groupUnmatched = await maybeUnmatchGroup(env, groupId);
+    return json({ success: true, registration, groupUnmatched }, 200, request, env);
   }
 
   if (path === '/attendance' && request.method === 'POST') {

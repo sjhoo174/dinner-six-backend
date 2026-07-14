@@ -261,6 +261,61 @@ if (registerDuringCooldown.status !== 400 || !registerDuringCooldown.data.retryA
   throw new Error('registering during the post-reject cooldown should be blocked and report a retryAt');
 }
 
+// --- Reject (before confirming) counts toward the SAME >=2 threshold as
+// attendance not_showing (after confirming) — mixing both channels should
+// still immediately unmatch the group once the combined count hits 2. ---
+
+const karaToken = await signInAs('kara@example.com', 'Kara Test');
+const leoToken = await signInAs('leo@example.com', 'Leo Test');
+const miaToken = await signInAs('mia@example.com', 'Mia Test');
+
+const karaProfile = { ...profile, name: 'Kara Tester', phone: '+65 9000 4444', area: 'CBD' };
+const leoProfile = { ...profile, name: 'Leo Tester', phone: '+65 9000 5555', area: 'CBD' };
+const miaProfile = { ...profile, name: 'Mia Tester', phone: '+65 9000 6666', area: 'CBD' };
+
+const karaReg = await json('/registrations', { method: 'POST', headers: authHeader(karaToken), body: karaProfile });
+const leoReg = await json('/registrations', { method: 'POST', headers: authHeader(leoToken), body: leoProfile });
+const miaReg = await json('/registrations', { method: 'POST', headers: authHeader(miaToken), body: miaProfile });
+
+const mixedGroupId = 'group-test-mixed-threshold';
+__test.seedMatchGroup(env, {
+  groupId: mixedGroupId,
+  restaurant: { id: 'r3', name: 'Supper Club Social', area: 'CBD', cuisine: 'Casual bistro and cocktails', perk: 'Extended happy-hour pricing for the group' },
+  eventAt: new Date(Date.now() + 5 * 86400000).toISOString(),
+  eventEndsAt: new Date(Date.now() + 5 * 86400000 + 2 * 3600000).toISOString(),
+  members: [
+    { email: 'kara@example.com', registrationId: karaReg.registration.id },
+    { email: 'leo@example.com', registrationId: leoReg.registration.id },
+    { email: 'mia@example.com', registrationId: miaReg.registration.id },
+    { email: 'noor@example.com', registrationId: 'reg-noor' },
+  ],
+});
+
+// Kara confirms, then sets attendance to not_showing (1st "can't make it" signal).
+await json('/match/confirm', { method: 'POST', headers: authHeader(karaToken), body: { registrationId: karaReg.registration.id } });
+const karaAttendance = await json('/attendance', { method: 'POST', headers: authHeader(karaToken), body: { groupId: mixedGroupId, status: 'not_showing' } });
+if (karaAttendance.groupUnmatched !== false) throw new Error('a single not_showing signal should not unmatch the group yet');
+
+// Leo never confirms and instead rejects (2nd "can't make it" signal, different channel — should cross the combined threshold).
+const leoReject = await json('/match/reject', { method: 'POST', headers: authHeader(leoToken), body: { registrationId: leoReg.registration.id } });
+if (leoReject.groupUnmatched !== true) throw new Error('a reject that crosses the combined threshold (with an existing not_showing) should immediately unmatch the group');
+if (leoReject.registration.status !== 'rejected') throw new Error('the rejecting member should still end up in rejected status');
+
+const karaMeAfterUnmatch = await json('/me', { headers: authHeader(karaToken) });
+if (karaMeAfterUnmatch.registrations.social.status !== 'pending' || karaMeAfterUnmatch.registrations.social.matchedGroupId) {
+  throw new Error('the member who set not_showing should be released back to pending once the combined threshold unmatches the group');
+}
+
+const miaMeAfterUnmatch = await json('/me', { headers: authHeader(miaToken) });
+if (miaMeAfterUnmatch.registrations.social.status !== 'pending' || miaMeAfterUnmatch.registrations.social.matchedGroupId) {
+  throw new Error('an uninvolved matched member should also be released once the combined threshold unmatches the group');
+}
+
+const leoRegisterDuringCooldown = await jsonExpectError('/registrations', { method: 'POST', headers: authHeader(leoToken), body: leoProfile });
+if (leoRegisterDuringCooldown.status !== 400 || !leoRegisterDuringCooldown.data.retryAt) {
+  throw new Error('the rejecter should stay in their own 6h cooldown, not get silently reverted to pending by the group-wide unmatch');
+}
+
 // --- Immediate unmatch when the not_showing threshold is crossed via /attendance ---
 // (should not need to wait for the matcher-worker's cron cycle)
 

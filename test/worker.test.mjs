@@ -515,12 +515,86 @@ if (!victorReportsMine.report || victorReportsMine.report.reportedRegistrationId
 const umaRegisterAfterBan = await jsonExpectError('/registrations', { method: 'POST', headers: authHeader(reportedToken), body: { ...reportProfile, name: 'Uma Tester', phone: '+65 9000 2001', dinnerType: 'professional' } });
 if (umaRegisterAfterBan.status !== 403) throw new Error('a banned user should be blocked from registering, even for a different dinner type');
 
+// --- Admin: fast-forward matched group(s) straight to the completed post-dinner
+// stage, so voting/reporting unlock without waiting for a real event_at to pass. ---
+
+const adminEnv = { ...env, ADMIN_API_KEY: 'test-admin-key' };
+
+const finnToken = await signInAs('finn@example.com', 'Finn Test');
+const gretaToken = await signInAs('greta@example.com', 'Greta Test');
+const completeProfile = { ...profile, area: 'North' };
+const finnReg = await json('/registrations', { method: 'POST', headers: authHeader(finnToken), body: { ...completeProfile, name: 'Finn Tester', phone: '+65 9000 3001' } });
+const gretaReg = await json('/registrations', { method: 'POST', headers: authHeader(gretaToken), body: { ...completeProfile, name: 'Greta Tester', phone: '+65 9000 3002' } });
+
+const completeGroupId = 'group-test-complete';
+__test.seedMatchGroup(env, {
+  groupId: completeGroupId,
+  restaurant: { id: 'r5', name: 'North Garden Social', area: 'North', cuisine: 'Casual garden bistro', perk: 'Free zero-proof welcome spritz' },
+  eventAt: new Date(Date.now() + 3 * 86400000).toISOString(), // a real future dinner, not yet happened
+  eventEndsAt: new Date(Date.now() + 3 * 86400000 + 2 * 3600000).toISOString(),
+  members: [
+    { email: 'finn@example.com', registrationId: finnReg.registration.id },
+    { email: 'greta@example.com', registrationId: gretaReg.registration.id },
+  ],
+});
+await json('/match/confirm', { method: 'POST', headers: authHeader(finnToken), body: { registrationId: finnReg.registration.id } });
+await json('/match/confirm', { method: 'POST', headers: authHeader(gretaToken), body: { registrationId: gretaReg.registration.id } });
+
+// Voting/reporting should not be available yet — the group genuinely hasn't happened.
+const voteTooEarly = await jsonExpectError('/votes', { method: 'POST', headers: authHeader(finnToken), body: { groupId: completeGroupId, voteeRegistrationId: gretaReg.registration.id, direction: 'up' } });
+if (voteTooEarly.status !== 400) throw new Error('voting should not be open before the group is completed');
+
+const completeWithoutKeyConfigured = await jsonExpectError('/admin/complete-group', { method: 'POST', headers: { 'X-Admin-Key': 'whatever' }, body: { groupId: completeGroupId } });
+if (completeWithoutKeyConfigured.status !== 404) throw new Error('admin complete-group should 404 when ADMIN_API_KEY is not configured');
+
+const completeWrongKey = await jsonExpectError('/admin/complete-group', { method: 'POST', headers: { 'X-Admin-Key': 'nope' }, body: { groupId: completeGroupId } }, adminEnv);
+if (completeWrongKey.status !== 404) throw new Error('admin complete-group should 404 with the wrong key');
+
+const completeUnknownGroup = await jsonExpectError('/admin/complete-group', { method: 'POST', headers: { 'X-Admin-Key': 'test-admin-key' }, body: { groupId: 'group-does-not-exist' } }, adminEnv);
+if (completeUnknownGroup.status !== 404) throw new Error('admin complete-group should 404 for an unknown/non-matched groupId');
+
+const completeResult = await json('/admin/complete-group', { method: 'POST', headers: { 'X-Admin-Key': 'test-admin-key' }, body: { groupId: completeGroupId } }, adminEnv);
+if (!completeResult.success || completeResult.groupsCompleted !== 1 || completeResult.membersCompleted !== 2) {
+  throw new Error('admin complete-group should report exactly one group and two members completed');
+}
+
+const finnAfterComplete = await json('/me', { headers: authHeader(finnToken) });
+if (finnAfterComplete.registrations.social.status !== 'completed') throw new Error('registration should flip to completed');
+if (!finnAfterComplete.registrations.social.match.groupCompleted) throw new Error('match.groupCompleted should be true after admin complete-group');
+
+// Voting and reporting should now work exactly as they would for a real completed dinner.
+const upVoteAfterComplete = await json('/votes', { method: 'POST', headers: authHeader(finnToken), body: { groupId: completeGroupId, voteeRegistrationId: gretaReg.registration.id, direction: 'up' } });
+if (!upVoteAfterComplete.success) throw new Error('voting should succeed once the group has been admin-completed');
+
+const reportAfterComplete = await json('/reports', { method: 'POST', headers: authHeader(gretaToken), body: { groupId: completeGroupId, reportedRegistrationId: finnReg.registration.id } });
+if (!reportAfterComplete.success) throw new Error('reporting should succeed once the group has been admin-completed');
+
+// Filtering by member email, and the no-filter "complete every currently matched group" mode.
+const hallToken = await signInAs('hall@example.com', 'Hall Test');
+const ivyToken = await signInAs('ivy@example.com', 'Ivy Test');
+const byEmailProfile = { ...profile, area: 'West' };
+const hallReg = await json('/registrations', { method: 'POST', headers: authHeader(hallToken), body: { ...byEmailProfile, name: 'Hall Tester', phone: '+65 9000 3003' } });
+const ivyReg = await json('/registrations', { method: 'POST', headers: authHeader(ivyToken), body: { ...byEmailProfile, name: 'Ivy Tester', phone: '+65 9000 3004' } });
+const byEmailGroupId = 'group-test-complete-by-email';
+__test.seedMatchGroup(env, {
+  groupId: byEmailGroupId,
+  restaurant: { id: 'r4', name: 'Westside Noodle Room', area: 'West', cuisine: 'Modern noodles and small plates', perk: 'Dessert platter for the table' },
+  eventAt: new Date(Date.now() + 3 * 86400000).toISOString(),
+  eventEndsAt: new Date(Date.now() + 3 * 86400000 + 2 * 3600000).toISOString(),
+  members: [
+    { email: 'hall@example.com', registrationId: hallReg.registration.id },
+    { email: 'ivy@example.com', registrationId: ivyReg.registration.id },
+  ],
+});
+const completeByEmail = await json('/admin/complete-group', { method: 'POST', headers: { 'X-Admin-Key': 'test-admin-key' }, body: { email: 'hall@example.com' } }, adminEnv);
+if (completeByEmail.groupsCompleted !== 1 || !completeByEmail.groupIds.includes(byEmailGroupId)) {
+  throw new Error('admin complete-group should find the matched group by member email');
+}
+
 // --- Admin reset endpoint (must run last — it wipes all state including sessions) ---
 
 const resetWithoutKeyConfigured = await jsonExpectError('/admin/reset', { method: 'POST', headers: { 'X-Admin-Key': 'whatever' } });
 if (resetWithoutKeyConfigured.status !== 404) throw new Error('admin reset should 404 when ADMIN_API_KEY is not configured');
-
-const adminEnv = { ...env, ADMIN_API_KEY: 'test-admin-key' };
 
 const resetWrongKey = await jsonExpectError('/admin/reset', { method: 'POST', headers: { 'X-Admin-Key': 'nope' } }, adminEnv);
 if (resetWrongKey.status !== 404) throw new Error('admin reset should 404 with the wrong key (same as not-found, not a distinguishable 403)');

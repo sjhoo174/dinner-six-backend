@@ -459,6 +459,98 @@ async function handle(request, env = {}) {
     return json({ success: true, storage: hasD1(env) ? 'd1' : 'memory' }, 200, request, env);
   }
 
+  // Testing/QA aid: fast-forwards matched group(s) straight to the 'completed'
+  // post-dinner stage that matcher-worker's markSuccessfulMatches would only
+  // reach once the real event_at time has passed and its cron has run. Mirrors
+  // that function's side effects (registration status, successful-match count,
+  // down-vote credit accrual) so voting/reporting unlock exactly as they would
+  // for a real completed dinner, without waiting days for the event date.
+  if (path === '/admin/complete-group' && request.method === 'POST') {
+    if (!env.ADMIN_API_KEY || request.headers.get('X-Admin-Key') !== env.ADMIN_API_KEY) {
+      return json({ error: 'Not found' }, 404, request, env);
+    }
+    const body = await request.json().catch(() => ({}));
+    const now = nowIso();
+    const pastEventAt = new Date(Date.now() - 8 * 3600000).toISOString();
+    const pastEventEndsAt = new Date(Date.now() - 6 * 3600000).toISOString();
+
+    let groupIds = [];
+    if (hasD1(env)) {
+      let res;
+      if (body.groupId) {
+        res = await env.DB.prepare(`SELECT id FROM match_groups WHERE id = ? AND status = 'matched'`).bind(body.groupId).all();
+      } else if (body.email) {
+        res = await env.DB.prepare(`
+          SELECT DISTINCT mg.id FROM match_groups mg
+          JOIN match_group_members mgm ON mgm.group_id = mg.id
+          WHERE mg.status = 'matched' AND mgm.email = ?
+        `).bind(normalizeEmail(body.email)).all();
+      } else {
+        res = await env.DB.prepare(`SELECT id FROM match_groups WHERE status = 'matched'`).all();
+      }
+      groupIds = (res.results || []).map(r => r.id);
+    } else {
+      for (const [id, group] of memory.matchGroups.entries()) {
+        if (group.status !== 'matched') continue;
+        if (body.groupId && body.groupId !== id) continue;
+        if (body.email) {
+          const members = memory.matchGroupMembers.get(id) || [];
+          if (!members.some(m => m.email === normalizeEmail(body.email))) continue;
+        }
+        groupIds.push(id);
+      }
+    }
+    if ((body.groupId || body.email) && !groupIds.length) {
+      return json({ error: 'No matched group found for that groupId/email' }, 404, request, env);
+    }
+
+    let membersCompleted = 0;
+    for (const groupId of groupIds) {
+      const members = await getMatchGroupMembers(env, groupId);
+      if (!members.length) continue;
+      if (hasD1(env)) {
+        const statements = [
+          env.DB.prepare(`UPDATE match_groups SET status = 'completed', event_at = ?, event_ends_at = ?, updated_at = ? WHERE id = ?`)
+            .bind(pastEventAt, pastEventEndsAt, now, groupId),
+        ];
+        for (const m of members) {
+          statements.push(
+            env.DB.prepare(`UPDATE registrations SET status = 'completed', updated_at = ? WHERE id = ? AND status IN ('matched', 'confirmed')`)
+              .bind(now, m.registrationId),
+          );
+          statements.push(
+            env.DB.prepare(`UPDATE users SET successful_matches_count = successful_matches_count + 1 WHERE email = ?`).bind(m.email),
+          );
+        }
+        await env.DB.batch(statements);
+
+        const placeholders = members.map(() => '?').join(',');
+        const counts = await env.DB.prepare(`SELECT email, successful_matches_count AS successfulMatchesCount FROM users WHERE email IN (${placeholders})`)
+          .bind(...members.map(m => m.email)).all();
+        const creditStatements = (counts.results || [])
+          .filter(u => Number(u.successfulMatchesCount) > 0 && Number(u.successfulMatchesCount) % 3 === 0)
+          .map(u => env.DB.prepare(`UPDATE users SET downvote_credits_available = downvote_credits_available + 1 WHERE email = ?`).bind(u.email));
+        if (creditStatements.length) await env.DB.batch(creditStatements);
+      } else {
+        const group = memory.matchGroups.get(groupId);
+        if (group) { group.status = 'completed'; group.eventAt = pastEventAt; group.eventEndsAt = pastEventEndsAt; }
+        for (const m of members) {
+          let reg = null;
+          for (const candidate of memory.registrations.values()) if (candidate.id === m.registrationId) { reg = candidate; break; }
+          if (reg && (reg.status === 'matched' || reg.status === 'confirmed')) reg.status = 'completed';
+          const u = memory.users.get(m.email);
+          if (u) {
+            u.successfulMatchesCount = (u.successfulMatchesCount || 0) + 1;
+            if (u.successfulMatchesCount > 0 && u.successfulMatchesCount % 3 === 0) u.downvoteCreditsAvailable = (u.downvoteCreditsAvailable || 0) + 1;
+          }
+        }
+      }
+      membersCompleted += members.length;
+    }
+
+    return json({ success: true, groupsCompleted: groupIds.length, membersCompleted, groupIds }, 200, request, env);
+  }
+
   if (path === '/auth/google/start' && request.method === 'GET') {
     if (!env.GOOGLE_CLIENT_ID) return json({ error: 'GOOGLE_CLIENT_ID is not configured' }, 500, request, env);
     const returnTo = safeReturnTo(url.searchParams.get('return_to'), env);

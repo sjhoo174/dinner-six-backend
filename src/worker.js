@@ -6,7 +6,6 @@ const memory = {
   matchGroups: new Map(),
   matchGroupMembers: new Map(),
   ratings: new Map(),
-  votes: new Map(),
   reports: new Map(),
 };
 
@@ -75,9 +74,8 @@ function hasD1(env) { return Boolean(env.DB?.prepare); }
 async function getUser(env, email) {
   if (hasD1(env)) {
     return env.DB.prepare(`SELECT email, name, created_at AS createdAt, updated_at AS updatedAt,
-      upvotes_received_total AS upvotesReceivedTotal, downvotes_received_total AS downvotesReceivedTotal,
-      successful_matches_count AS successfulMatchesCount, downvote_credits_available AS downvoteCreditsAvailable,
-      banned FROM users WHERE email = ?`).bind(email).first();
+      successful_matches_count AS successfulMatchesCount, banned, diner_code AS dinerCode, phone
+      FROM users WHERE email = ?`).bind(email).first();
   }
   return memory.users.get(email) || null;
 }
@@ -85,9 +83,8 @@ async function upsertUser(env, user) {
   const existing = await getUser(env, user.email);
   const record = {
     email: user.email, name: user.name || existing?.name || '', updatedAt: nowIso(), createdAt: existing?.createdAt || nowIso(),
-    upvotesReceivedTotal: existing?.upvotesReceivedTotal || 0, downvotesReceivedTotal: existing?.downvotesReceivedTotal || 0,
-    successfulMatchesCount: existing?.successfulMatchesCount || 0, downvoteCreditsAvailable: existing?.downvoteCreditsAvailable || 0,
-    banned: existing?.banned || 0,
+    successfulMatchesCount: existing?.successfulMatchesCount || 0,
+    banned: existing?.banned || 0, dinerCode: existing?.dinerCode || null, phone: existing?.phone || null,
   };
   if (hasD1(env)) {
     await env.DB.prepare(`INSERT INTO users (email, name, created_at, updated_at)
@@ -97,11 +94,59 @@ async function upsertUser(env, user) {
   } else memory.users.set(record.email, record);
   return record;
 }
-// A diner's displayed reputation floors at zero even though the raw
-// upvotes/downvotes totals keep counting uncapped (the raw totals are what
-// feed the down-vote-credit accrual math, so they must never be clamped).
-function reputationScore(userRecord) {
-  return Math.max(0, (userRecord?.upvotesReceivedTotal || 0) - (userRecord?.downvotesReceivedTotal || 0));
+const DINER_CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no 0/O/1/I/L — avoids visual ambiguity
+function generateDinerCode() {
+  let code = '';
+  const bytes = crypto.getRandomValues(new Uint8Array(6));
+  for (const b of bytes) code += DINER_CODE_ALPHABET[b % DINER_CODE_ALPHABET.length];
+  return `DS-${code}`;
+}
+// Assigned once, the first time a diner registers — persistent across all
+// their future registrations/matches. Idempotent: a user who already has one
+// keeps it. Collisions against the unique index are vanishingly rare at this
+// alphabet size, but retried a few times regardless rather than assumed away.
+async function ensureDinerCode(env, email) {
+  const existing = await getUser(env, email);
+  if (existing?.dinerCode) return existing.dinerCode;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const code = generateDinerCode();
+    if (hasD1(env)) {
+      try {
+        await env.DB.prepare('UPDATE users SET diner_code = ? WHERE email = ? AND diner_code IS NULL').bind(code, email).run();
+      } catch {
+        continue;
+      }
+      const updated = await getUser(env, email);
+      if (updated?.dinerCode) return updated.dinerCode;
+    } else {
+      const record = memory.users.get(email);
+      if (!record) return null;
+      if (record.dinerCode) return record.dinerCode;
+      if ([...memory.users.values()].some(u => u.dinerCode === code)) continue;
+      record.dinerCode = code;
+      return code;
+    }
+  }
+  throw new Error('Could not assign a unique diner code');
+}
+// Phone must be globally unique across accounts. The pre-check gives a
+// friendly error; the UNIQUE index on users.phone is the real guarantee
+// against a race between two concurrent registrations with the same number.
+async function setUniquePhone(env, email, phone) {
+  if (hasD1(env)) {
+    const owner = await env.DB.prepare('SELECT email FROM users WHERE phone = ? AND email != ?').bind(phone, email).first();
+    if (owner) throw new Error('PHONE_TAKEN');
+    try {
+      await env.DB.prepare('UPDATE users SET phone = ? WHERE email = ?').bind(phone, email).run();
+    } catch {
+      throw new Error('PHONE_TAKEN');
+    }
+  } else {
+    const owner = [...memory.users.values()].find(u => u.phone === phone && u.email !== email);
+    if (owner) throw new Error('PHONE_TAKEN');
+    const record = memory.users.get(email);
+    if (record) record.phone = phone;
+  }
 }
 async function saveSession(env, token, email) {
   const record = { token, email, createdAt: nowIso(), expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString() };
@@ -210,9 +255,11 @@ async function getMatchGroupMembers(env, groupId) {
   if (hasD1(env)) {
     const res = await env.DB.prepare(`
       SELECT mgm.group_id AS groupId, mgm.email AS email, mgm.registration_id AS registrationId,
-             mgm.attendance_status AS attendanceStatus, r.profile_json AS profileJson, r.status AS registrationStatus
+             mgm.attendance_status AS attendanceStatus, r.profile_json AS profileJson, r.status AS registrationStatus,
+             u.diner_code AS dinerCode
       FROM match_group_members mgm
       JOIN registrations r ON r.id = mgm.registration_id
+      JOIN users u ON u.email = mgm.email
       WHERE mgm.group_id = ?
     `).bind(groupId).all();
     return res.results || [];
@@ -221,7 +268,7 @@ async function getMatchGroupMembers(env, groupId) {
   return members.map(m => {
     let reg = null;
     for (const candidate of memory.registrations.values()) if (candidate.id === m.registrationId) { reg = candidate; break; }
-    return { ...m, profileJson: reg ? JSON.stringify(reg.profile) : '{}', registrationStatus: reg?.status };
+    return { ...m, profileJson: reg ? JSON.stringify(reg.profile) : '{}', registrationStatus: reg?.status, dinerCode: memory.users.get(m.email)?.dinerCode || null };
   });
 }
 
@@ -329,8 +376,6 @@ async function loadMatchForRegistration(env, reg) {
   const restaurant = JSON.parse(group.restaurant_json || group.restaurantJson || 'null');
   const eventAt = group.event_at || group.eventAt || null;
   const eventEndsAt = group.event_ends_at || group.eventEndsAt || null;
-  const ratingWindowHours = Number(env.RATING_WINDOW_HOURS || 3);
-  const ratingWindowOpensAt = eventEndsAt ? new Date(new Date(eventEndsAt).getTime() + ratingWindowHours * 3600000).toISOString() : null;
   const groupStatus = group.status || 'matched';
   const groupCompleted = groupStatus === 'completed';
   let isLatestSuccessfulGroup = false;
@@ -345,12 +390,12 @@ async function loadMatchForRegistration(env, reg) {
     restaurant,
     eventAt,
     eventEndsAt,
-    ratingWindowOpensAt,
     dinnerType: reg.profile?.dinnerType || 'social',
     group: members.map(m => {
       const profile = typeof m.profileJson === 'string' ? JSON.parse(m.profileJson) : (m.profile || {});
       return {
         registrationId: m.registrationId,
+        dinerCode: m.dinerCode || null,
         name: profile.name, industry: profile.industry, gender: profile.gender,
         vibe: profile.vibe, energy: profile.energy, topics: profile.topics,
         networkingGoal: profile.networkingGoal || null,
@@ -595,8 +640,7 @@ async function handle(request, env = {}) {
       user: {
         email: user.email, name: user.name,
         banned: Boolean(userRecord?.banned),
-        downvoteCreditsAvailable: userRecord?.downvoteCreditsAvailable || 0,
-        reputationScore: reputationScore(userRecord),
+        dinerCode: userRecord?.dinerCode || null,
       },
       registrations: { social, professional },
     }, 200, request, env);
@@ -618,6 +662,7 @@ async function handle(request, env = {}) {
     if (profile.gender && !['Male', 'Female'].includes(profile.gender)) return json({ error: 'Gender must be Male or Female' }, 400, request, env);
     if (profile.dinnerType && !['social', 'professional'].includes(profile.dinnerType)) return json({ error: 'Dinner type must be social or professional' }, 400, request, env);
     if (!profile.dinnerType) profile.dinnerType = 'social';
+    profile.phone = String(profile.phone).trim();
 
     // Mutually exclusive within a dinner type, independent across types — a
     // user can have one active social AND one active professional
@@ -636,6 +681,16 @@ async function handle(request, env = {}) {
       }
     }
 
+    // A phone number identifies one account, same as email — block reuse
+    // across different Google accounts (e.g. to dodge a ban via a second sign-in).
+    try {
+      await setUniquePhone(env, user.email, profile.phone);
+    } catch (err) {
+      if (err.message === 'PHONE_TAKEN') return json({ error: 'This phone number is already registered to another account.' }, 400, request, env);
+      throw err;
+    }
+    const dinerCode = await ensureDinerCode(env, user.email);
+
     const created = Date.now();
     const registration = {
       id: crypto.randomUUID(), email: user.email, status: 'pending', profile, match: null,
@@ -643,7 +698,7 @@ async function handle(request, env = {}) {
       confirmedAt: null, rejectedAt: null, matchedGroupId: null, dinnerType: profile.dinnerType,
     };
     await saveRegistration(env, registration);
-    return json({ registration }, 200, request, env);
+    return json({ registration, dinerCode }, 200, request, env);
   }
 
   const statusMatch = path.match(/^\/registrations\/([^/]+)\/status$/);
@@ -726,33 +781,38 @@ async function handle(request, env = {}) {
     return json({ success: true, attendanceStatus: body.status, groupUnmatched }, 200, request, env);
   }
 
+  // Diners rate each other 1-5 stars — the single consolidated feedback
+  // mechanism (previously split between a separate "rate your table"
+  // comment+star feature and a credit-gated up/down vote). Same eligibility
+  // rule the old up/down vote used: only open on the diner's LATEST
+  // successfully matched group, one rating per tablemate per group.
   if (path === '/ratings' && request.method === 'POST') {
     const body = await request.json().catch(() => ({}));
     const rating = Number(body.rating);
     if (!Number.isInteger(rating) || rating < 1 || rating > 5) return json({ error: 'rating must be an integer from 1 to 5' }, 400, request, env);
-    const group = await getMatchGroup(env, body.groupId);
-    if (!group) return json({ error: 'Match group not found' }, 404, request, env);
-    const raterMembership = await findMembership(env, body.groupId, user.email);
-    if (!raterMembership) return json({ error: 'Not a member of this group' }, 404, request, env);
+    const latest = await getLatestSuccessfulGroup(env, user.email);
+    if (!latest || latest.groupId !== body.groupId) {
+      return json({ error: 'Rating is only open for your latest successfully matched group' }, 400, request, env);
+    }
     const members = await getMatchGroupMembers(env, body.groupId);
     const ratee = members.find(m => m.registrationId === body.rateeRegistrationId);
-    if (!ratee) return json({ error: 'Rated member not found in this group' }, 404, request, env);
+    if (!ratee) return json({ error: 'Tablemate not found in this group' }, 404, request, env);
     if (ratee.email === user.email) return json({ error: 'Cannot rate yourself' }, 400, request, env);
-    const eventEndsAt = group.event_ends_at || group.eventEndsAt;
-    const ratingWindowHours = Number(env.RATING_WINDOW_HOURS || 3);
-    const opensAt = eventEndsAt ? new Date(eventEndsAt).getTime() + ratingWindowHours * 3600000 : Infinity;
-    if (Date.now() < opensAt) return json({ error: `Ratings open ${ratingWindowHours} hours after the event ends` }, 400, request, env);
+
+    const existingRating = hasD1(env)
+      ? await env.DB.prepare('SELECT id FROM ratings WHERE group_id = ? AND rater_email = ? AND ratee_email = ?').bind(body.groupId, user.email, ratee.email).first()
+      : memory.ratings.get(`${body.groupId}:${user.email}:${ratee.email}`);
+    if (existingRating) return json({ error: 'You already rated this person in this group' }, 400, request, env);
+
     const createdAt = nowIso();
-    const comment = typeof body.comment === 'string' ? body.comment.slice(0, 500) : null;
+    const ratingId = crypto.randomUUID();
     if (hasD1(env)) {
-      await env.DB.prepare(`INSERT INTO ratings (id, group_id, rater_email, ratee_email, rating, comment, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(group_id, rater_email, ratee_email) DO UPDATE SET rating = excluded.rating, comment = excluded.comment, created_at = excluded.created_at`)
-        .bind(crypto.randomUUID(), body.groupId, user.email, ratee.email, rating, comment, createdAt).run();
+      await env.DB.prepare('INSERT INTO ratings (id, group_id, rater_email, ratee_email, rating, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .bind(ratingId, body.groupId, user.email, ratee.email, rating, createdAt).run();
     } else {
-      memory.ratings.set(`${body.groupId}:${user.email}:${ratee.email}`, { groupId: body.groupId, raterEmail: user.email, rateeEmail: ratee.email, rating, comment, createdAt });
+      memory.ratings.set(`${body.groupId}:${user.email}:${ratee.email}`, { id: ratingId, groupId: body.groupId, raterEmail: user.email, rateeEmail: ratee.email, rating, createdAt });
     }
-    return json({ success: true, rating: { rateeRegistrationId: body.rateeRegistrationId, rating, comment } }, 200, request, env);
+    return json({ success: true }, 200, request, env);
   }
 
   if (path === '/ratings/mine' && request.method === 'GET') {
@@ -760,88 +820,16 @@ async function handle(request, env = {}) {
     const members = await getMatchGroupMembers(env, groupId);
     let rows;
     if (hasD1(env)) {
-      const res = await env.DB.prepare('SELECT ratee_email AS rateeEmail, rating, comment FROM ratings WHERE group_id = ? AND rater_email = ?').bind(groupId, user.email).all();
+      const res = await env.DB.prepare('SELECT ratee_email AS rateeEmail, rating FROM ratings WHERE group_id = ? AND rater_email = ?').bind(groupId, user.email).all();
       rows = res.results || [];
     } else {
       rows = [...memory.ratings.values()].filter(r => r.groupId === groupId && r.raterEmail === user.email);
     }
     const ratings = rows.map(r => {
       const member = members.find(m => m.email === r.rateeEmail);
-      return { rateeRegistrationId: member?.registrationId || null, rating: r.rating, comment: r.comment };
+      return { rateeRegistrationId: member?.registrationId || null, rating: r.rating };
     });
     return json({ ratings }, 200, request, env);
-  }
-
-  if (path === '/votes' && request.method === 'POST') {
-    const body = await request.json().catch(() => ({}));
-    if (!['up', 'down'].includes(body.direction)) return json({ error: 'direction must be up or down' }, 400, request, env);
-    const latest = await getLatestSuccessfulGroup(env, user.email);
-    if (!latest || latest.groupId !== body.groupId) {
-      return json({ error: 'Voting is only open for your latest successfully matched group' }, 400, request, env);
-    }
-    const members = await getMatchGroupMembers(env, body.groupId);
-    const votee = members.find(m => m.registrationId === body.voteeRegistrationId);
-    if (!votee) return json({ error: 'Tablemate not found in this group' }, 404, request, env);
-    if (votee.email === user.email) return json({ error: 'Cannot vote for yourself' }, 400, request, env);
-
-    const existingVote = hasD1(env)
-      ? await env.DB.prepare('SELECT id FROM votes WHERE group_id = ? AND voter_email = ? AND votee_email = ?').bind(body.groupId, user.email, votee.email).first()
-      : memory.votes.get(`${body.groupId}:${user.email}:${votee.email}`);
-    if (existingVote) return json({ error: 'You already voted for this person in this group' }, 400, request, env);
-
-    if (body.direction === 'down') {
-      const voter = await getUser(env, user.email);
-      if ((voter?.downvoteCreditsAvailable || 0) <= 0) return json({ error: 'No down-vote credits available' }, 400, request, env);
-    }
-
-    const createdAt = nowIso();
-    const voteId = crypto.randomUUID();
-    if (hasD1(env)) {
-      await env.DB.prepare('INSERT INTO votes (id, group_id, voter_email, votee_email, direction, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-        .bind(voteId, body.groupId, user.email, votee.email, body.direction, createdAt).run();
-      if (body.direction === 'up') {
-        await env.DB.prepare('UPDATE users SET upvotes_received_total = upvotes_received_total + 1 WHERE email = ?').bind(votee.email).run();
-        const updated = await env.DB.prepare('SELECT upvotes_received_total AS c FROM users WHERE email = ?').bind(votee.email).first();
-        if (updated && Number(updated.c) % 3 === 0) {
-          await env.DB.prepare('UPDATE users SET downvote_credits_available = downvote_credits_available + 1 WHERE email = ?').bind(votee.email).run();
-        }
-      } else {
-        await env.DB.prepare('UPDATE users SET downvotes_received_total = downvotes_received_total + 1 WHERE email = ?').bind(votee.email).run();
-        await env.DB.prepare('UPDATE users SET downvote_credits_available = MAX(0, downvote_credits_available - 1) WHERE email = ?').bind(user.email).run();
-      }
-    } else {
-      memory.votes.set(`${body.groupId}:${user.email}:${votee.email}`, { id: voteId, groupId: body.groupId, voterEmail: user.email, voteeEmail: votee.email, direction: body.direction, createdAt });
-      const voteeUser = memory.users.get(votee.email);
-      if (body.direction === 'up') {
-        if (voteeUser) {
-          voteeUser.upvotesReceivedTotal = (voteeUser.upvotesReceivedTotal || 0) + 1;
-          if (voteeUser.upvotesReceivedTotal % 3 === 0) voteeUser.downvoteCreditsAvailable = (voteeUser.downvoteCreditsAvailable || 0) + 1;
-        }
-      } else {
-        if (voteeUser) voteeUser.downvotesReceivedTotal = (voteeUser.downvotesReceivedTotal || 0) + 1;
-        const voterUser = memory.users.get(user.email);
-        if (voterUser) voterUser.downvoteCreditsAvailable = Math.max(0, (voterUser.downvoteCreditsAvailable || 0) - 1);
-      }
-    }
-
-    return json({ success: true }, 200, request, env);
-  }
-
-  if (path === '/votes/mine' && request.method === 'GET') {
-    const groupId = url.searchParams.get('groupId') || '';
-    const members = await getMatchGroupMembers(env, groupId);
-    let rows;
-    if (hasD1(env)) {
-      const res = await env.DB.prepare('SELECT votee_email AS voteeEmail, direction FROM votes WHERE group_id = ? AND voter_email = ?').bind(groupId, user.email).all();
-      rows = res.results || [];
-    } else {
-      rows = [...memory.votes.values()].filter(v => v.groupId === groupId && v.voterEmail === user.email);
-    }
-    const votes = rows.map(r => {
-      const member = members.find(m => m.email === r.voteeEmail);
-      return { voteeRegistrationId: member?.registrationId || null, direction: r.direction };
-    });
-    return json({ votes }, 200, request, env);
   }
 
   if (path === '/reports' && request.method === 'POST') {

@@ -166,7 +166,7 @@ const meMatched = await json('/me', { headers: authHeader(token) });
 if (meMatched.registrations.social.status !== 'matched') throw new Error('seeded match should surface as matched');
 if (!meMatched.registrations.social.match || meMatched.registrations.social.match.restaurant.area !== 'East') throw new Error('match/status did not resolve as expected from seeded group');
 if (meMatched.registrations.social.match.compatibility != null) throw new Error('real matches should not carry a fabricated compatibility score');
-if (!meMatched.registrations.social.match.eventAt || !meMatched.registrations.social.match.ratingWindowOpensAt) throw new Error('match should expose eventAt/ratingWindowOpensAt');
+if (!meMatched.registrations.social.match.eventAt) throw new Error('match should expose eventAt');
 if (meMatched.registrations.professional.status !== 'pending') throw new Error('the professional track should be unaffected by the social match');
 const adaEntryBeforeConfirm = meMatched.registrations.social.match.group.find(p => p.isUser);
 if (adaEntryBeforeConfirm.confirmed !== false) throw new Error('member should not show as confirmed before confirming');
@@ -199,30 +199,10 @@ const otherToken = await signInAs('carla@example.com', 'Carla Test');
 const attendanceNonMember = await jsonExpectError('/attendance', { method: 'POST', headers: authHeader(otherToken), body: { groupId, status: 'on_time' } });
 if (attendanceNonMember.status !== 404) throw new Error('non-member attendance update should 404');
 
-// Ratings: the window is already open (eventEndsAt is > RATING_WINDOW_HOURS in the past).
-const rateBo = await json('/ratings', { method: 'POST', headers: authHeader(token), body: { groupId, rateeRegistrationId: 'reg-bo', rating: 5, comment: 'Great company!' } });
-if (!rateBo.success || rateBo.rating.rating !== 5) throw new Error('rating submission failed');
-
-const ratingsMine = await json('/ratings/mine?groupId=' + groupId, { headers: authHeader(token) });
-if (!ratingsMine.ratings.some(r => r.rateeRegistrationId === 'reg-bo' && r.rating === 5)) throw new Error('submitted rating should appear in /ratings/mine');
-
-const selfRateRejected = await jsonExpectError('/ratings', { method: 'POST', headers: authHeader(token), body: { groupId, rateeRegistrationId: created.registration.id, rating: 5 } });
-if (selfRateRejected.status !== 400) throw new Error('self-rating should be rejected');
-
-// Ratings before the eligibility window (event not yet ended + 3h) should be rejected.
-const futureGroupId = 'group-test-future';
-__test.seedMatchGroup(env, {
-  groupId: futureGroupId,
-  restaurant: { id: 'r1', name: 'Neighbourhood Table', area: 'Central', cuisine: 'Modern Asian sharing plates', perk: 'Complimentary welcome drink for each guest' },
-  eventAt: new Date(Date.now() + 3600000).toISOString(),
-  eventEndsAt: new Date(Date.now() + 2 * 3600000).toISOString(),
-  members: [
-    { email: 'ada@example.com', registrationId: created.registration.id },
-    { email: 'dee@example.com', registrationId: 'reg-dee' },
-  ],
-});
-const ratingTooEarly = await jsonExpectError('/ratings', { method: 'POST', headers: authHeader(token), body: { groupId: futureGroupId, rateeRegistrationId: 'reg-dee', rating: 4 } });
-if (ratingTooEarly.status !== 400) throw new Error('rating before the eligibility window should be rejected');
+// Rating here should be rejected — this seeded group is only 'matched', not 'completed' yet
+// (ratings, like the old votes, are gated on groupCompleted + being the rater's latest group).
+const rateBeforeCompleted = await jsonExpectError('/ratings', { method: 'POST', headers: authHeader(token), body: { groupId, rateeRegistrationId: 'reg-bo', rating: 5 } });
+if (rateBeforeCompleted.status !== 400) throw new Error('rating should be rejected before the group is completed');
 
 // --- Reject flow (separate user so it doesn't disturb ada's confirmed state above) ---
 
@@ -368,7 +348,7 @@ if (irisMeAfterUnmatch.registrations.social.status !== 'pending' || irisMeAfterU
 const irisAttendanceAfterUnmatch = await jsonExpectError('/attendance', { method: 'POST', headers: authHeader(irisToken), body: { groupId: immediateGroupId, status: 'on_time' } });
 if (irisAttendanceAfterUnmatch.status !== 404) throw new Error('attendance should 404 once the group has been unmatched — the registration no longer points at that group');
 
-// --- Voting system: up/down vote diners in the latest successfully matched group ---
+// --- Ratings system: diners rate each other 1-5 stars in the latest successfully matched group ---
 
 const patriciaToken = await signInAs('patricia@example.com', 'Patricia Test');
 const quinnToken = await signInAs('quinn@example.com', 'Quinn Test');
@@ -380,6 +360,10 @@ const patriciaReg = await json('/registrations', { method: 'POST', headers: auth
 const quinnReg = await json('/registrations', { method: 'POST', headers: authHeader(quinnToken), body: { ...votingProfile, name: 'Quinn Tester', phone: '+65 9000 8888' } });
 const rosaReg = await json('/registrations', { method: 'POST', headers: authHeader(rosaToken), body: { ...votingProfile, name: 'Rosa Tester', phone: '+65 9000 9990' } });
 const samReg = await json('/registrations', { method: 'POST', headers: authHeader(samToken), body: { ...votingProfile, name: 'Sam Tester', phone: '+65 9000 1230' } });
+
+if (!patriciaReg.dinerCode || !patriciaReg.dinerCode.startsWith('DS-')) throw new Error('registering for the first time should assign a diner code');
+const patriciaRegAgainCode = await json('/registrations', { method: 'POST', headers: authHeader(patriciaToken), body: { ...votingProfile, name: 'Patricia Tester', phone: '+65 9000 7777', dinnerType: 'professional' } });
+if (patriciaRegAgainCode.dinerCode !== patriciaReg.dinerCode) throw new Error('a diner code should be assigned once and stay stable across further registrations');
 
 const votingGroupId = 'group-test-voting';
 __test.seedMatchGroup(env, {
@@ -400,37 +384,24 @@ const patriciaMe = await json('/me', { headers: authHeader(patriciaToken) });
 if (patriciaMe.registrations.social.status !== 'completed') throw new Error('a group that survives past its event start time should flip the registration to completed');
 if (!patriciaMe.registrations.social.match || !patriciaMe.registrations.social.match.groupCompleted) throw new Error('match should expose groupCompleted for a successfully matched group');
 if (!patriciaMe.registrations.social.match.isLatestSuccessfulGroup) throw new Error('this should be patricia\'s latest successful group');
+const quinnInPatriciaMatch = patriciaMe.registrations.social.match.group.find(p => p.registrationId === quinnReg.registration.id);
+if (!quinnInPatriciaMatch.dinerCode) throw new Error('tablemates should expose their diner code in the match payload');
 
-const upVote = await json('/votes', { method: 'POST', headers: authHeader(patriciaToken), body: { groupId: votingGroupId, voteeRegistrationId: quinnReg.registration.id, direction: 'up' } });
-if (!upVote.success) throw new Error('up-vote should succeed');
+const badRating = await jsonExpectError('/ratings', { method: 'POST', headers: authHeader(patriciaToken), body: { groupId: votingGroupId, rateeRegistrationId: quinnReg.registration.id, rating: 0 } });
+if (badRating.status !== 400) throw new Error('a rating outside 1-5 should be rejected');
 
-const dupVote = await jsonExpectError('/votes', { method: 'POST', headers: authHeader(patriciaToken), body: { groupId: votingGroupId, voteeRegistrationId: quinnReg.registration.id, direction: 'up' } });
-if (dupVote.status !== 400) throw new Error('voting twice for the same tablemate in the same group should be rejected');
+const starRating = await json('/ratings', { method: 'POST', headers: authHeader(patriciaToken), body: { groupId: votingGroupId, rateeRegistrationId: quinnReg.registration.id, rating: 5 } });
+if (!starRating.success) throw new Error('star rating should succeed');
 
-const selfVote = await jsonExpectError('/votes', { method: 'POST', headers: authHeader(patriciaToken), body: { groupId: votingGroupId, voteeRegistrationId: patriciaReg.registration.id, direction: 'up' } });
-if (selfVote.status !== 400) throw new Error('self-vote should be rejected');
+const dupRating = await jsonExpectError('/ratings', { method: 'POST', headers: authHeader(patriciaToken), body: { groupId: votingGroupId, rateeRegistrationId: quinnReg.registration.id, rating: 3 } });
+if (dupRating.status !== 400) throw new Error('rating the same tablemate twice in the same group should be rejected');
 
-const downVoteNoCredits = await jsonExpectError('/votes', { method: 'POST', headers: authHeader(patriciaToken), body: { groupId: votingGroupId, voteeRegistrationId: rosaReg.registration.id, direction: 'down' } });
-if (downVoteNoCredits.status !== 400) throw new Error('down-voting with zero credits should be rejected');
+const selfRating = await jsonExpectError('/ratings', { method: 'POST', headers: authHeader(patriciaToken), body: { groupId: votingGroupId, rateeRegistrationId: patriciaReg.registration.id, rating: 5 } });
+if (selfRating.status !== 400) throw new Error('self-rating should be rejected');
 
-__test.setUserStats(env, 'patricia@example.com', { downvoteCreditsAvailable: 1 });
-const downVoteOk = await json('/votes', { method: 'POST', headers: authHeader(patriciaToken), body: { groupId: votingGroupId, voteeRegistrationId: rosaReg.registration.id, direction: 'down' } });
-if (!downVoteOk.success) throw new Error('down-vote should succeed once a credit is available');
+await json('/ratings', { method: 'POST', headers: authHeader(patriciaToken), body: { groupId: votingGroupId, rateeRegistrationId: rosaReg.registration.id, rating: 2 } });
 
-const patriciaMeAfterDownvote = await json('/me', { headers: authHeader(patriciaToken) });
-if (patriciaMeAfterDownvote.user.downvoteCreditsAvailable !== 0) throw new Error('spending a down-vote credit should decrement the balance');
-
-const rosaMe = await json('/me', { headers: authHeader(rosaToken) });
-if (rosaMe.user.reputationScore !== 0) throw new Error('a lone down-vote against a diner with no upvotes should floor reputation at zero, not go negative');
-
-// Quinn receives 3 upvotes total (from patricia above, plus rosa and sam here) — the 3rd should grant a down-vote credit.
-await json('/votes', { method: 'POST', headers: authHeader(rosaToken), body: { groupId: votingGroupId, voteeRegistrationId: quinnReg.registration.id, direction: 'up' } });
-await json('/votes', { method: 'POST', headers: authHeader(samToken), body: { groupId: votingGroupId, voteeRegistrationId: quinnReg.registration.id, direction: 'up' } });
-const quinnMe = await json('/me', { headers: authHeader(quinnToken) });
-if (quinnMe.user.downvoteCreditsAvailable !== 1) throw new Error('receiving the 3rd up-vote should grant exactly 1 down-vote credit');
-if (quinnMe.user.reputationScore !== 3) throw new Error('quinn should show a reputation score of 3 (3 upvotes, 0 downvotes)');
-
-// Voting is only allowed in the voter's LATEST successful group.
+// Rating is only allowed in the rater's LATEST successful group.
 const olderVotingGroupId = 'group-test-voting-older';
 __test.seedMatchGroup(env, {
   groupId: olderVotingGroupId,
@@ -443,12 +414,15 @@ __test.seedMatchGroup(env, {
     { email: 'tia@example.com', registrationId: 'reg-tia' },
   ],
 });
-const voteInOlderGroup = await jsonExpectError('/votes', { method: 'POST', headers: authHeader(patriciaToken), body: { groupId: olderVotingGroupId, voteeRegistrationId: 'reg-tia', direction: 'up' } });
-if (voteInOlderGroup.status !== 400) throw new Error('voting in a group that is not the voter\'s latest successful group should be rejected');
+const rateInOlderGroup = await jsonExpectError('/ratings', { method: 'POST', headers: authHeader(patriciaToken), body: { groupId: olderVotingGroupId, rateeRegistrationId: 'reg-tia', rating: 4 } });
+if (rateInOlderGroup.status !== 400) throw new Error('rating in a group that is not the rater\'s latest successful group should be rejected');
 
-const patriciaVotesMine = await json('/votes/mine?groupId=' + votingGroupId, { headers: authHeader(patriciaToken) });
-if (!patriciaVotesMine.votes.some(v => v.voteeRegistrationId === quinnReg.registration.id && v.direction === 'up')) throw new Error('/votes/mine should reflect the cast up-vote');
-if (!patriciaVotesMine.votes.some(v => v.voteeRegistrationId === rosaReg.registration.id && v.direction === 'down')) throw new Error('/votes/mine should reflect the cast down-vote');
+const patriciaRatingsMine = await json('/ratings/mine?groupId=' + votingGroupId, { headers: authHeader(patriciaToken) });
+if (!patriciaRatingsMine.ratings.some(r => r.rateeRegistrationId === quinnReg.registration.id && r.rating === 5)) throw new Error('/ratings/mine should reflect the 5-star rating');
+if (!patriciaRatingsMine.ratings.some(r => r.rateeRegistrationId === rosaReg.registration.id && r.rating === 2)) throw new Error('/ratings/mine should reflect the 2-star rating');
+
+const dupPhone = await jsonExpectError('/registrations', { method: 'POST', headers: authHeader(quinnToken), body: { ...votingProfile, name: 'Quinn Duplicate', phone: '+65 9000 7777', dinnerType: 'professional' } });
+if (dupPhone.status !== 400) throw new Error('registering with a phone number already used by a different account should be rejected');
 
 // --- Reporting system: 1 report chance per successfully matched group; 3
 // reports from 3 unique reporters within the reported diner's last 3
@@ -540,9 +514,9 @@ __test.seedMatchGroup(env, {
 await json('/match/confirm', { method: 'POST', headers: authHeader(finnToken), body: { registrationId: finnReg.registration.id } });
 await json('/match/confirm', { method: 'POST', headers: authHeader(gretaToken), body: { registrationId: gretaReg.registration.id } });
 
-// Voting/reporting should not be available yet — the group genuinely hasn't happened.
-const voteTooEarly = await jsonExpectError('/votes', { method: 'POST', headers: authHeader(finnToken), body: { groupId: completeGroupId, voteeRegistrationId: gretaReg.registration.id, direction: 'up' } });
-if (voteTooEarly.status !== 400) throw new Error('voting should not be open before the group is completed');
+// Rating/reporting should not be available yet — the group genuinely hasn't happened.
+const rateTooEarly = await jsonExpectError('/ratings', { method: 'POST', headers: authHeader(finnToken), body: { groupId: completeGroupId, rateeRegistrationId: gretaReg.registration.id, rating: 5 } });
+if (rateTooEarly.status !== 400) throw new Error('rating should not be open before the group is completed');
 
 const completeWithoutKeyConfigured = await jsonExpectError('/admin/complete-group', { method: 'POST', headers: { 'X-Admin-Key': 'whatever' }, body: { groupId: completeGroupId } });
 if (completeWithoutKeyConfigured.status !== 404) throw new Error('admin complete-group should 404 when ADMIN_API_KEY is not configured');
@@ -562,9 +536,9 @@ const finnAfterComplete = await json('/me', { headers: authHeader(finnToken) });
 if (finnAfterComplete.registrations.social.status !== 'completed') throw new Error('registration should flip to completed');
 if (!finnAfterComplete.registrations.social.match.groupCompleted) throw new Error('match.groupCompleted should be true after admin complete-group');
 
-// Voting and reporting should now work exactly as they would for a real completed dinner.
-const upVoteAfterComplete = await json('/votes', { method: 'POST', headers: authHeader(finnToken), body: { groupId: completeGroupId, voteeRegistrationId: gretaReg.registration.id, direction: 'up' } });
-if (!upVoteAfterComplete.success) throw new Error('voting should succeed once the group has been admin-completed');
+// Rating and reporting should now work exactly as they would for a real completed dinner.
+const ratingAfterComplete = await json('/ratings', { method: 'POST', headers: authHeader(finnToken), body: { groupId: completeGroupId, rateeRegistrationId: gretaReg.registration.id, rating: 5 } });
+if (!ratingAfterComplete.success) throw new Error('rating should succeed once the group has been admin-completed');
 
 const reportAfterComplete = await json('/reports', { method: 'POST', headers: authHeader(gretaToken), body: { groupId: completeGroupId, reportedRegistrationId: finnReg.registration.id } });
 if (!reportAfterComplete.success) throw new Error('reporting should succeed once the group has been admin-completed');

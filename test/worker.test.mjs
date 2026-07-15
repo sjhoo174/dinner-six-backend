@@ -368,6 +368,153 @@ if (irisMeAfterUnmatch.registrations.social.status !== 'pending' || irisMeAfterU
 const irisAttendanceAfterUnmatch = await jsonExpectError('/attendance', { method: 'POST', headers: authHeader(irisToken), body: { groupId: immediateGroupId, status: 'on_time' } });
 if (irisAttendanceAfterUnmatch.status !== 404) throw new Error('attendance should 404 once the group has been unmatched — the registration no longer points at that group');
 
+// --- Voting system: up/down vote diners in the latest successfully matched group ---
+
+const patriciaToken = await signInAs('patricia@example.com', 'Patricia Test');
+const quinnToken = await signInAs('quinn@example.com', 'Quinn Test');
+const rosaToken = await signInAs('rosa@example.com', 'Rosa Test');
+const samToken = await signInAs('sam@example.com', 'Sam Test');
+
+const votingProfile = { ...profile, area: 'Central' };
+const patriciaReg = await json('/registrations', { method: 'POST', headers: authHeader(patriciaToken), body: { ...votingProfile, name: 'Patricia Tester', phone: '+65 9000 7777' } });
+const quinnReg = await json('/registrations', { method: 'POST', headers: authHeader(quinnToken), body: { ...votingProfile, name: 'Quinn Tester', phone: '+65 9000 8888' } });
+const rosaReg = await json('/registrations', { method: 'POST', headers: authHeader(rosaToken), body: { ...votingProfile, name: 'Rosa Tester', phone: '+65 9000 9990' } });
+const samReg = await json('/registrations', { method: 'POST', headers: authHeader(samToken), body: { ...votingProfile, name: 'Sam Tester', phone: '+65 9000 1230' } });
+
+const votingGroupId = 'group-test-voting';
+__test.seedMatchGroup(env, {
+  groupId: votingGroupId,
+  restaurant: { id: 'r1', name: 'Neighbourhood Table', area: 'Central', cuisine: 'Modern Asian sharing plates', perk: 'Complimentary welcome drink for each guest' },
+  eventAt: new Date(Date.now() - 5 * 86400000).toISOString(),
+  eventEndsAt: new Date(Date.now() - 5 * 86400000 + 2 * 3600000).toISOString(),
+  status: 'completed',
+  members: [
+    { email: 'patricia@example.com', registrationId: patriciaReg.registration.id },
+    { email: 'quinn@example.com', registrationId: quinnReg.registration.id },
+    { email: 'rosa@example.com', registrationId: rosaReg.registration.id },
+    { email: 'sam@example.com', registrationId: samReg.registration.id },
+  ],
+});
+
+const patriciaMe = await json('/me', { headers: authHeader(patriciaToken) });
+if (patriciaMe.registrations.social.status !== 'completed') throw new Error('a group that survives past its event start time should flip the registration to completed');
+if (!patriciaMe.registrations.social.match || !patriciaMe.registrations.social.match.groupCompleted) throw new Error('match should expose groupCompleted for a successfully matched group');
+if (!patriciaMe.registrations.social.match.isLatestSuccessfulGroup) throw new Error('this should be patricia\'s latest successful group');
+
+const upVote = await json('/votes', { method: 'POST', headers: authHeader(patriciaToken), body: { groupId: votingGroupId, voteeRegistrationId: quinnReg.registration.id, direction: 'up' } });
+if (!upVote.success) throw new Error('up-vote should succeed');
+
+const dupVote = await jsonExpectError('/votes', { method: 'POST', headers: authHeader(patriciaToken), body: { groupId: votingGroupId, voteeRegistrationId: quinnReg.registration.id, direction: 'up' } });
+if (dupVote.status !== 400) throw new Error('voting twice for the same tablemate in the same group should be rejected');
+
+const selfVote = await jsonExpectError('/votes', { method: 'POST', headers: authHeader(patriciaToken), body: { groupId: votingGroupId, voteeRegistrationId: patriciaReg.registration.id, direction: 'up' } });
+if (selfVote.status !== 400) throw new Error('self-vote should be rejected');
+
+const downVoteNoCredits = await jsonExpectError('/votes', { method: 'POST', headers: authHeader(patriciaToken), body: { groupId: votingGroupId, voteeRegistrationId: rosaReg.registration.id, direction: 'down' } });
+if (downVoteNoCredits.status !== 400) throw new Error('down-voting with zero credits should be rejected');
+
+__test.setUserStats(env, 'patricia@example.com', { downvoteCreditsAvailable: 1 });
+const downVoteOk = await json('/votes', { method: 'POST', headers: authHeader(patriciaToken), body: { groupId: votingGroupId, voteeRegistrationId: rosaReg.registration.id, direction: 'down' } });
+if (!downVoteOk.success) throw new Error('down-vote should succeed once a credit is available');
+
+const patriciaMeAfterDownvote = await json('/me', { headers: authHeader(patriciaToken) });
+if (patriciaMeAfterDownvote.user.downvoteCreditsAvailable !== 0) throw new Error('spending a down-vote credit should decrement the balance');
+
+const rosaMe = await json('/me', { headers: authHeader(rosaToken) });
+if (rosaMe.user.reputationScore !== 0) throw new Error('a lone down-vote against a diner with no upvotes should floor reputation at zero, not go negative');
+
+// Quinn receives 3 upvotes total (from patricia above, plus rosa and sam here) — the 3rd should grant a down-vote credit.
+await json('/votes', { method: 'POST', headers: authHeader(rosaToken), body: { groupId: votingGroupId, voteeRegistrationId: quinnReg.registration.id, direction: 'up' } });
+await json('/votes', { method: 'POST', headers: authHeader(samToken), body: { groupId: votingGroupId, voteeRegistrationId: quinnReg.registration.id, direction: 'up' } });
+const quinnMe = await json('/me', { headers: authHeader(quinnToken) });
+if (quinnMe.user.downvoteCreditsAvailable !== 1) throw new Error('receiving the 3rd up-vote should grant exactly 1 down-vote credit');
+if (quinnMe.user.reputationScore !== 3) throw new Error('quinn should show a reputation score of 3 (3 upvotes, 0 downvotes)');
+
+// Voting is only allowed in the voter's LATEST successful group.
+const olderVotingGroupId = 'group-test-voting-older';
+__test.seedMatchGroup(env, {
+  groupId: olderVotingGroupId,
+  restaurant: { id: 'r2', name: 'The Long Bar Table', area: 'East', cuisine: 'Mediterranean tapas', perk: 'Shared appetiser platter on the house' },
+  eventAt: new Date(Date.now() - 20 * 86400000).toISOString(),
+  eventEndsAt: new Date(Date.now() - 20 * 86400000 + 2 * 3600000).toISOString(),
+  status: 'completed',
+  members: [
+    { email: 'patricia@example.com', registrationId: 'reg-patricia-old' },
+    { email: 'tia@example.com', registrationId: 'reg-tia' },
+  ],
+});
+const voteInOlderGroup = await jsonExpectError('/votes', { method: 'POST', headers: authHeader(patriciaToken), body: { groupId: olderVotingGroupId, voteeRegistrationId: 'reg-tia', direction: 'up' } });
+if (voteInOlderGroup.status !== 400) throw new Error('voting in a group that is not the voter\'s latest successful group should be rejected');
+
+const patriciaVotesMine = await json('/votes/mine?groupId=' + votingGroupId, { headers: authHeader(patriciaToken) });
+if (!patriciaVotesMine.votes.some(v => v.voteeRegistrationId === quinnReg.registration.id && v.direction === 'up')) throw new Error('/votes/mine should reflect the cast up-vote');
+if (!patriciaVotesMine.votes.some(v => v.voteeRegistrationId === rosaReg.registration.id && v.direction === 'down')) throw new Error('/votes/mine should reflect the cast down-vote');
+
+// --- Reporting system: 1 report chance per successfully matched group; 3
+// reports from 3 unique reporters within the reported diner's last 3
+// successful matches permanently bans them. ---
+
+const reportedToken = await signInAs('uma@example.com', 'Uma Test');
+const reporter1Token = await signInAs('victor@example.com', 'Victor Test');
+const reporter2Token = await signInAs('wendy@example.com', 'Wendy Test');
+const reporter3Token = await signInAs('xavier@example.com', 'Xavier Test');
+
+const reportProfile = { ...profile, area: 'CBD' };
+await json('/registrations', { method: 'POST', headers: authHeader(reportedToken), body: { ...reportProfile, name: 'Uma Tester', phone: '+65 9000 2001' } });
+const victorReg = await json('/registrations', { method: 'POST', headers: authHeader(reporter1Token), body: { ...reportProfile, name: 'Victor Tester', phone: '+65 9000 2002' } });
+const wendyReg = await json('/registrations', { method: 'POST', headers: authHeader(reporter2Token), body: { ...reportProfile, name: 'Wendy Tester', phone: '+65 9000 2003' } });
+const xavierReg = await json('/registrations', { method: 'POST', headers: authHeader(reporter3Token), body: { ...reportProfile, name: 'Xavier Tester', phone: '+65 9000 2004' } });
+
+const reportRounds = [[reporter1Token, victorReg], [reporter2Token, wendyReg], [reporter3Token, xavierReg]];
+for (let i = 0; i < reportRounds.length; i += 1) {
+  const [reporterToken, reporterReg] = reportRounds[i];
+  const gId = `group-test-report-${i}`;
+  __test.seedMatchGroup(env, {
+    groupId: gId,
+    restaurant: { id: 'r3', name: 'Supper Club Social', area: 'CBD', cuisine: 'Casual bistro and cocktails', perk: 'Extended happy-hour pricing for the group' },
+    eventAt: new Date(Date.now() - (10 - i) * 86400000).toISOString(),
+    eventEndsAt: new Date(Date.now() - (10 - i) * 86400000 + 2 * 3600000).toISOString(),
+    status: 'completed',
+    members: [
+      { email: 'uma@example.com', registrationId: `reg-uma-${i}` },
+      { email: reporterReg.registration.email, registrationId: reporterReg.registration.id },
+    ],
+  });
+  __test.setUserStats(env, 'uma@example.com', { successfulMatchesCount: i + 1 });
+  const reportRes = await json('/reports', { method: 'POST', headers: authHeader(reporterToken), body: { groupId: gId, reportedRegistrationId: `reg-uma-${i}` } });
+  if (i < 2) {
+    if (reportRes.banned) throw new Error(`uma should not be banned after only ${i + 1} report(s)`);
+  } else if (!reportRes.banned) {
+    throw new Error('uma should be banned after 3 reports from 3 unique reporters within her last 3 successful matches');
+  }
+}
+
+const dupReport = await jsonExpectError('/reports', { method: 'POST', headers: authHeader(reporter1Token), body: { groupId: 'group-test-report-0', reportedRegistrationId: 'reg-uma-0' } });
+if (dupReport.status !== 400) throw new Error('a reporter should only get one report chance per group');
+
+const selfReport = await jsonExpectError('/reports', { method: 'POST', headers: authHeader(reportedToken), body: { groupId: 'group-test-report-0', reportedRegistrationId: 'reg-uma-0' } });
+if (selfReport.status !== 400) throw new Error('self-report should be rejected');
+
+const notYetCompleteGroupId = 'group-test-report-not-complete';
+__test.seedMatchGroup(env, {
+  groupId: notYetCompleteGroupId,
+  restaurant: { id: 'r6', name: 'NEX Table Club', area: 'North-East', cuisine: 'Asian-European comfort plates', perk: 'Chef snack to share' },
+  eventAt: new Date(Date.now() + 86400000).toISOString(),
+  eventEndsAt: new Date(Date.now() + 86400000 + 2 * 3600000).toISOString(),
+  members: [
+    { email: 'uma@example.com', registrationId: 'reg-uma-pending' },
+    { email: 'victor@example.com', registrationId: 'reg-victor-pending' },
+  ],
+});
+const reportBeforeComplete = await jsonExpectError('/reports', { method: 'POST', headers: authHeader(reporter1Token), body: { groupId: notYetCompleteGroupId, reportedRegistrationId: 'reg-uma-pending' } });
+if (reportBeforeComplete.status !== 400) throw new Error('reports should only be allowed for a successfully matched (completed) group');
+
+const victorReportsMine = await json('/reports/mine?groupId=group-test-report-0', { headers: authHeader(reporter1Token) });
+if (!victorReportsMine.report || victorReportsMine.report.reportedRegistrationId !== 'reg-uma-0') throw new Error('/reports/mine should reflect the filed report');
+
+const umaRegisterAfterBan = await jsonExpectError('/registrations', { method: 'POST', headers: authHeader(reportedToken), body: { ...reportProfile, name: 'Uma Tester', phone: '+65 9000 2001', dinnerType: 'professional' } });
+if (umaRegisterAfterBan.status !== 403) throw new Error('a banned user should be blocked from registering, even for a different dinner type');
+
 // --- Admin reset endpoint (must run last — it wipes all state including sessions) ---
 
 const resetWithoutKeyConfigured = await jsonExpectError('/admin/reset', { method: 'POST', headers: { 'X-Admin-Key': 'whatever' } });

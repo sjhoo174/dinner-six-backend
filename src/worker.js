@@ -6,6 +6,8 @@ const memory = {
   matchGroups: new Map(),
   matchGroupMembers: new Map(),
   ratings: new Map(),
+  votes: new Map(),
+  reports: new Map(),
 };
 
 export const defaultRestaurants = [
@@ -71,12 +73,22 @@ async function verifyToken(token, env) {
 function hasD1(env) { return Boolean(env.DB?.prepare); }
 
 async function getUser(env, email) {
-  if (hasD1(env)) return env.DB.prepare('SELECT email, name, created_at AS createdAt, updated_at AS updatedAt FROM users WHERE email = ?').bind(email).first();
+  if (hasD1(env)) {
+    return env.DB.prepare(`SELECT email, name, created_at AS createdAt, updated_at AS updatedAt,
+      upvotes_received_total AS upvotesReceivedTotal, downvotes_received_total AS downvotesReceivedTotal,
+      successful_matches_count AS successfulMatchesCount, downvote_credits_available AS downvoteCreditsAvailable,
+      banned FROM users WHERE email = ?`).bind(email).first();
+  }
   return memory.users.get(email) || null;
 }
 async function upsertUser(env, user) {
   const existing = await getUser(env, user.email);
-  const record = { email: user.email, name: user.name || existing?.name || '', updatedAt: nowIso(), createdAt: existing?.createdAt || nowIso() };
+  const record = {
+    email: user.email, name: user.name || existing?.name || '', updatedAt: nowIso(), createdAt: existing?.createdAt || nowIso(),
+    upvotesReceivedTotal: existing?.upvotesReceivedTotal || 0, downvotesReceivedTotal: existing?.downvotesReceivedTotal || 0,
+    successfulMatchesCount: existing?.successfulMatchesCount || 0, downvoteCreditsAvailable: existing?.downvoteCreditsAvailable || 0,
+    banned: existing?.banned || 0,
+  };
   if (hasD1(env)) {
     await env.DB.prepare(`INSERT INTO users (email, name, created_at, updated_at)
       VALUES (?, ?, ?, ?)
@@ -84,6 +96,12 @@ async function upsertUser(env, user) {
       .bind(record.email, record.name, record.createdAt, record.updatedAt).run();
   } else memory.users.set(record.email, record);
   return record;
+}
+// A diner's displayed reputation floors at zero even though the raw
+// upvotes/downvotes totals keep counting uncapped (the raw totals are what
+// feed the down-vote-credit accrual math, so they must never be clamped).
+function reputationScore(userRecord) {
+  return Math.max(0, (userRecord?.upvotesReceivedTotal || 0) - (userRecord?.downvotesReceivedTotal || 0));
 }
 async function saveSession(env, token, email) {
   const record = { token, email, createdAt: nowIso(), expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString() };
@@ -259,6 +277,50 @@ async function maybeUnmatchGroup(env, groupId) {
   return false;
 }
 
+// The voting system only opens on a diner's most recent successfully
+// matched group (status flips to 'completed' once the matcher-worker cron
+// confirms the group survived intact past its event start time).
+async function getLatestSuccessfulGroup(env, email) {
+  if (hasD1(env)) {
+    return env.DB.prepare(`
+      SELECT mg.id AS groupId, mg.event_at AS eventAt
+      FROM match_group_members mgm
+      JOIN match_groups mg ON mg.id = mgm.group_id
+      WHERE mgm.email = ? AND mg.status = 'completed'
+      ORDER BY mg.event_at DESC LIMIT 1
+    `).bind(email).first();
+  }
+  let best = null;
+  for (const [groupId, members] of memory.matchGroupMembers.entries()) {
+    if (!members.some(m => m.email === email)) continue;
+    const group = memory.matchGroups.get(groupId);
+    if (!group || group.status !== 'completed') continue;
+    if (!best || new Date(group.eventAt) > new Date(best.eventAt)) best = { groupId, eventAt: group.eventAt };
+  }
+  return best;
+}
+
+// A report stays "active" only within the reported diner's last 3
+// successful matches — comparing each report's snapshot against their
+// current successful_matches_count makes old reports fall out of the ban
+// window automatically, with no separate expiry job needed.
+async function countActiveReports(env, reportedEmail) {
+  const reportedUser = await getUser(env, reportedEmail);
+  const currentCount = reportedUser?.successfulMatchesCount || 0;
+  if (hasD1(env)) {
+    const res = await env.DB.prepare(`
+      SELECT COUNT(DISTINCT reporter_email) AS c FROM reports
+      WHERE reported_email = ? AND (? - reported_match_count_at_report) < 3
+    `).bind(reportedEmail, currentCount).first();
+    return res?.c || 0;
+  }
+  const reporters = new Set();
+  for (const r of memory.reports.values()) {
+    if (r.reportedEmail === reportedEmail && (currentCount - r.reportedMatchCountAtReport) < 3) reporters.add(r.reporterEmail);
+  }
+  return reporters.size;
+}
+
 async function loadMatchForRegistration(env, reg) {
   if (!reg.matchedGroupId) return null;
   const group = await getMatchGroup(env, reg.matchedGroupId);
@@ -269,8 +331,17 @@ async function loadMatchForRegistration(env, reg) {
   const eventEndsAt = group.event_ends_at || group.eventEndsAt || null;
   const ratingWindowHours = Number(env.RATING_WINDOW_HOURS || 3);
   const ratingWindowOpensAt = eventEndsAt ? new Date(new Date(eventEndsAt).getTime() + ratingWindowHours * 3600000).toISOString() : null;
+  const groupStatus = group.status || 'matched';
+  const groupCompleted = groupStatus === 'completed';
+  let isLatestSuccessfulGroup = false;
+  if (groupCompleted) {
+    const latest = await getLatestSuccessfulGroup(env, reg.email);
+    isLatestSuccessfulGroup = latest?.groupId === group.id;
+  }
   return {
     groupId: group.id,
+    groupCompleted,
+    isLatestSuccessfulGroup,
     restaurant,
     eventAt,
     eventEndsAt,
@@ -302,7 +373,10 @@ function waitMs(profile, env) {
 }
 async function attachMatch(env, reg) {
   if (!reg) return reg;
-  if (reg.matchedGroupId && (reg.status === 'matched' || reg.status === 'confirmed')) {
+  // 'completed' means the group survived past its event start time — the
+  // registration is done (free to register again) but match data (and now
+  // voting/reporting) should keep rendering for that past dinner.
+  if (reg.matchedGroupId && ['matched', 'confirmed', 'completed'].includes(reg.status)) {
     reg.match = await loadMatchForRegistration(env, reg);
   } else {
     reg.match = null;
@@ -420,11 +494,20 @@ async function handle(request, env = {}) {
   if (!user) return json({ error: 'Sign in required' }, 401, request, env);
 
   if (path === '/me' && request.method === 'GET') {
-    const [social, professional] = await Promise.all([
+    const [social, professional, userRecord] = await Promise.all([
       currentRegistration(user.email, 'social', env),
       currentRegistration(user.email, 'professional', env),
+      getUser(env, user.email),
     ]);
-    return json({ user: { email: user.email, name: user.name }, registrations: { social, professional } }, 200, request, env);
+    return json({
+      user: {
+        email: user.email, name: user.name,
+        banned: Boolean(userRecord?.banned),
+        downvoteCreditsAvailable: userRecord?.downvoteCreditsAvailable || 0,
+        reputationScore: reputationScore(userRecord),
+      },
+      registrations: { social, professional },
+    }, 200, request, env);
   }
   if (path === '/registrations/current' && request.method === 'GET') {
     const dinnerType = url.searchParams.get('dinnerType') === 'professional' ? 'professional' : 'social';
@@ -432,6 +515,8 @@ async function handle(request, env = {}) {
   }
 
   if (path === '/registrations' && request.method === 'POST') {
+    const requester = await getUser(env, user.email);
+    if (requester?.banned) return json({ error: 'Your account has been suspended and can no longer register.' }, 403, request, env);
     const profile = await request.json().catch(() => ({}));
     const remoteIp = request.headers.get('CF-Connecting-IP');
     const turnstileOk = await verifyTurnstile(profile.turnstileToken, remoteIp, env);
@@ -595,14 +680,139 @@ async function handle(request, env = {}) {
     return json({ ratings }, 200, request, env);
   }
 
+  if (path === '/votes' && request.method === 'POST') {
+    const body = await request.json().catch(() => ({}));
+    if (!['up', 'down'].includes(body.direction)) return json({ error: 'direction must be up or down' }, 400, request, env);
+    const latest = await getLatestSuccessfulGroup(env, user.email);
+    if (!latest || latest.groupId !== body.groupId) {
+      return json({ error: 'Voting is only open for your latest successfully matched group' }, 400, request, env);
+    }
+    const members = await getMatchGroupMembers(env, body.groupId);
+    const votee = members.find(m => m.registrationId === body.voteeRegistrationId);
+    if (!votee) return json({ error: 'Tablemate not found in this group' }, 404, request, env);
+    if (votee.email === user.email) return json({ error: 'Cannot vote for yourself' }, 400, request, env);
+
+    const existingVote = hasD1(env)
+      ? await env.DB.prepare('SELECT id FROM votes WHERE group_id = ? AND voter_email = ? AND votee_email = ?').bind(body.groupId, user.email, votee.email).first()
+      : memory.votes.get(`${body.groupId}:${user.email}:${votee.email}`);
+    if (existingVote) return json({ error: 'You already voted for this person in this group' }, 400, request, env);
+
+    if (body.direction === 'down') {
+      const voter = await getUser(env, user.email);
+      if ((voter?.downvoteCreditsAvailable || 0) <= 0) return json({ error: 'No down-vote credits available' }, 400, request, env);
+    }
+
+    const createdAt = nowIso();
+    const voteId = crypto.randomUUID();
+    if (hasD1(env)) {
+      await env.DB.prepare('INSERT INTO votes (id, group_id, voter_email, votee_email, direction, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .bind(voteId, body.groupId, user.email, votee.email, body.direction, createdAt).run();
+      if (body.direction === 'up') {
+        await env.DB.prepare('UPDATE users SET upvotes_received_total = upvotes_received_total + 1 WHERE email = ?').bind(votee.email).run();
+        const updated = await env.DB.prepare('SELECT upvotes_received_total AS c FROM users WHERE email = ?').bind(votee.email).first();
+        if (updated && Number(updated.c) % 3 === 0) {
+          await env.DB.prepare('UPDATE users SET downvote_credits_available = downvote_credits_available + 1 WHERE email = ?').bind(votee.email).run();
+        }
+      } else {
+        await env.DB.prepare('UPDATE users SET downvotes_received_total = downvotes_received_total + 1 WHERE email = ?').bind(votee.email).run();
+        await env.DB.prepare('UPDATE users SET downvote_credits_available = MAX(0, downvote_credits_available - 1) WHERE email = ?').bind(user.email).run();
+      }
+    } else {
+      memory.votes.set(`${body.groupId}:${user.email}:${votee.email}`, { id: voteId, groupId: body.groupId, voterEmail: user.email, voteeEmail: votee.email, direction: body.direction, createdAt });
+      const voteeUser = memory.users.get(votee.email);
+      if (body.direction === 'up') {
+        if (voteeUser) {
+          voteeUser.upvotesReceivedTotal = (voteeUser.upvotesReceivedTotal || 0) + 1;
+          if (voteeUser.upvotesReceivedTotal % 3 === 0) voteeUser.downvoteCreditsAvailable = (voteeUser.downvoteCreditsAvailable || 0) + 1;
+        }
+      } else {
+        if (voteeUser) voteeUser.downvotesReceivedTotal = (voteeUser.downvotesReceivedTotal || 0) + 1;
+        const voterUser = memory.users.get(user.email);
+        if (voterUser) voterUser.downvoteCreditsAvailable = Math.max(0, (voterUser.downvoteCreditsAvailable || 0) - 1);
+      }
+    }
+
+    return json({ success: true }, 200, request, env);
+  }
+
+  if (path === '/votes/mine' && request.method === 'GET') {
+    const groupId = url.searchParams.get('groupId') || '';
+    const members = await getMatchGroupMembers(env, groupId);
+    let rows;
+    if (hasD1(env)) {
+      const res = await env.DB.prepare('SELECT votee_email AS voteeEmail, direction FROM votes WHERE group_id = ? AND voter_email = ?').bind(groupId, user.email).all();
+      rows = res.results || [];
+    } else {
+      rows = [...memory.votes.values()].filter(v => v.groupId === groupId && v.voterEmail === user.email);
+    }
+    const votes = rows.map(r => {
+      const member = members.find(m => m.email === r.voteeEmail);
+      return { voteeRegistrationId: member?.registrationId || null, direction: r.direction };
+    });
+    return json({ votes }, 200, request, env);
+  }
+
+  if (path === '/reports' && request.method === 'POST') {
+    const body = await request.json().catch(() => ({}));
+    const group = await getMatchGroup(env, body.groupId);
+    const groupStatus = group?.status;
+    if (!group || groupStatus !== 'completed') return json({ error: 'Reports can only be filed for a successfully matched group' }, 400, request, env);
+    const membership = await findMembership(env, body.groupId, user.email);
+    if (!membership) return json({ error: 'Not a member of this group' }, 404, request, env);
+
+    const existingReport = hasD1(env)
+      ? await env.DB.prepare('SELECT id FROM reports WHERE group_id = ? AND reporter_email = ?').bind(body.groupId, user.email).first()
+      : [...memory.reports.values()].find(r => r.groupId === body.groupId && r.reporterEmail === user.email);
+    if (existingReport) return json({ error: 'You already used your report chance for this group' }, 400, request, env);
+
+    const members = await getMatchGroupMembers(env, body.groupId);
+    const reported = members.find(m => m.registrationId === body.reportedRegistrationId);
+    if (!reported) return json({ error: 'Tablemate not found in this group' }, 404, request, env);
+    if (reported.email === user.email) return json({ error: 'Cannot report yourself' }, 400, request, env);
+
+    const reportedUser = await getUser(env, reported.email);
+    const reportedMatchCountAtReport = reportedUser?.successfulMatchesCount || 0;
+    const createdAt = nowIso();
+    const reason = typeof body.reason === 'string' ? body.reason.slice(0, 500) : null;
+    const reportId = crypto.randomUUID();
+
+    if (hasD1(env)) {
+      await env.DB.prepare('INSERT INTO reports (id, group_id, reporter_email, reported_email, reason, reported_match_count_at_report, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .bind(reportId, body.groupId, user.email, reported.email, reason, reportedMatchCountAtReport, createdAt).run();
+    } else {
+      memory.reports.set(`${body.groupId}:${user.email}`, { id: reportId, groupId: body.groupId, reporterEmail: user.email, reportedEmail: reported.email, reason, reportedMatchCountAtReport, createdAt });
+    }
+
+    const activeReports = await countActiveReports(env, reported.email);
+    let banned = false;
+    if (activeReports >= 3) {
+      banned = true;
+      if (hasD1(env)) await env.DB.prepare('UPDATE users SET banned = 1 WHERE email = ?').bind(reported.email).run();
+      else { const u = memory.users.get(reported.email); if (u) u.banned = 1; }
+    }
+
+    return json({ success: true, banned }, 200, request, env);
+  }
+
+  if (path === '/reports/mine' && request.method === 'GET') {
+    const groupId = url.searchParams.get('groupId') || '';
+    const members = await getMatchGroupMembers(env, groupId);
+    const row = hasD1(env)
+      ? await env.DB.prepare('SELECT reported_email AS reportedEmail FROM reports WHERE group_id = ? AND reporter_email = ?').bind(groupId, user.email).first()
+      : [...memory.reports.values()].find(r => r.groupId === groupId && r.reporterEmail === user.email);
+    const reportedEmail = row?.reportedEmail;
+    const member = reportedEmail ? members.find(m => m.email === reportedEmail) : null;
+    return json({ report: row ? { reportedRegistrationId: member?.registrationId || null } : null }, 200, request, env);
+  }
+
   return json({ error: 'Not found' }, 404, request, env);
 }
 
 export const __test = {
-  seedMatchGroup(env, { groupId, restaurant, eventAt, eventEndsAt, members }) {
+  seedMatchGroup(env, { groupId, restaurant, eventAt, eventEndsAt, members, status = 'matched' }) {
     const now = nowIso();
     memory.matchGroups.set(groupId, {
-      id: groupId, status: 'matched', memberCount: members.length, algorithmVersion: 'test',
+      id: groupId, status, memberCount: members.length, algorithmVersion: 'test',
       restaurantJson: JSON.stringify(restaurant), eventAt, eventEndsAt, createdAt: now, updatedAt: now,
     });
     memory.matchGroupMembers.set(groupId, members.map(m => ({
@@ -613,8 +823,12 @@ export const __test = {
       for (const candidate of memory.registrations.values()) {
         if (candidate.id === m.registrationId || candidate.email === m.email) { reg = candidate; break; }
       }
-      if (reg) { reg.status = 'matched'; reg.matchedGroupId = groupId; }
+      if (reg) { reg.status = status === 'completed' ? 'completed' : 'matched'; reg.matchedGroupId = groupId; }
     }
+  },
+  setUserStats(env, email, fields) {
+    const record = memory.users.get(email);
+    if (record) Object.assign(record, fields);
   },
 };
 

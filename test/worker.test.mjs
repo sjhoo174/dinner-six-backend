@@ -49,6 +49,20 @@ async function signInAs(email, name) {
   return new URLSearchParams(hash).get('auth_token');
 }
 
+async function withTwilioMock(twilioHandler, fn) {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options = {}) => {
+    const href = String(url);
+    if (href.startsWith('https://verify.twilio.com/')) return twilioHandler(href, options);
+    return realFetch(url, options);
+  };
+  try {
+    return await fn();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
 const emailStart = await worker.fetch(new Request(base + '/auth/start', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
@@ -564,6 +578,65 @@ const completeByEmail = await json('/admin/complete-group', { method: 'POST', he
 if (completeByEmail.groupsCompleted !== 1 || !completeByEmail.groupIds.includes(byEmailGroupId)) {
   throw new Error('admin complete-group should find the matched group by member email');
 }
+
+// --- Twilio phone verification ---
+
+const twilioEnv = { ...env, TWILIO_ACCOUNT_SID: 'AC_test', TWILIO_AUTH_TOKEN: 'test-token', TWILIO_VERIFY_SERVICE_SID: 'VA_test' };
+
+const jackToken = await signInAs('jack@example.com', 'Jack Test');
+const sendCodeNotConfigured = await jsonExpectError('/phone/send-code', { method: 'POST', headers: authHeader(jackToken), body: { phone: '+65 9111 1111' } });
+if (sendCodeNotConfigured.status !== 503) throw new Error('send-code should 503 when Twilio is not configured');
+
+// Registration should not require verification while Twilio isn't configured at all.
+const jackProfile = { ...profile, area: 'CBD', name: 'Jack Tester', phone: '+65 9111 1111' };
+const jackRegNoTwilio = await json('/registrations', { method: 'POST', headers: authHeader(jackToken), body: jackProfile });
+if (!jackRegNoTwilio.registration) throw new Error('registration should succeed without phone verification when Twilio is not configured');
+
+const kellyToken = await signInAs('kelly@example.com', 'Kelly Test');
+const kellyPhone = '+65 9222 2222';
+const kellyProfile = { ...profile, area: 'CBD', name: 'Kelly Tester', phone: kellyPhone };
+
+// Once Twilio IS configured, registration should require verification first.
+const regBeforeVerify = await jsonExpectError('/registrations', { method: 'POST', headers: authHeader(kellyToken), body: kellyProfile }, twilioEnv);
+if (regBeforeVerify.status !== 400) throw new Error('registration should require phone verification once Twilio is configured');
+
+await withTwilioMock(async (href) => {
+  if (href.includes('/Verifications')) return new Response(JSON.stringify({ status: 'pending' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  return new Response(JSON.stringify({ error: 'unexpected Twilio call: ' + href }), { status: 500 });
+}, async () => {
+  const sendOk = await json('/phone/send-code', { method: 'POST', headers: authHeader(kellyToken), body: { phone: kellyPhone } }, twilioEnv);
+  if (!sendOk.success) throw new Error('send-code should succeed once Twilio is configured');
+
+  const sendAgainTooSoon = await jsonExpectError('/phone/send-code', { method: 'POST', headers: authHeader(kellyToken), body: { phone: kellyPhone } }, twilioEnv);
+  if (sendAgainTooSoon.status !== 429) throw new Error('re-sending a code within the cooldown window should be rejected');
+});
+
+await withTwilioMock(async (href) => {
+  if (href.includes('/VerificationCheck')) return new Response(JSON.stringify({ status: 'denied' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  return new Response(JSON.stringify({ error: 'unexpected Twilio call: ' + href }), { status: 500 });
+}, async () => {
+  const wrongCode = await jsonExpectError('/phone/verify-code', { method: 'POST', headers: authHeader(kellyToken), body: { phone: kellyPhone, code: '000000' } }, twilioEnv);
+  if (wrongCode.status !== 400) throw new Error('an incorrect code should be rejected');
+});
+
+const regStillBlocked = await jsonExpectError('/registrations', { method: 'POST', headers: authHeader(kellyToken), body: kellyProfile }, twilioEnv);
+if (regStillBlocked.status !== 400) throw new Error('registration should still be blocked after a failed verification attempt');
+
+await withTwilioMock(async (href) => {
+  if (href.includes('/VerificationCheck')) return new Response(JSON.stringify({ status: 'approved' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  return new Response(JSON.stringify({ error: 'unexpected Twilio call: ' + href }), { status: 500 });
+}, async () => {
+  const rightCode = await json('/phone/verify-code', { method: 'POST', headers: authHeader(kellyToken), body: { phone: kellyPhone, code: '123456' } }, twilioEnv);
+  if (!rightCode.verified) throw new Error('a correct code should verify the phone');
+});
+
+const regAfterVerify = await json('/registrations', { method: 'POST', headers: authHeader(kellyToken), body: kellyProfile }, twilioEnv);
+if (!regAfterVerify.registration) throw new Error('registration should succeed once the phone is verified');
+
+// send-code should reject a phone already claimed by a different account.
+const lanaToken = await signInAs('lana@example.com', 'Lana Test');
+const sendCodeTakenPhone = await jsonExpectError('/phone/send-code', { method: 'POST', headers: authHeader(lanaToken), body: { phone: kellyPhone } }, twilioEnv);
+if (sendCodeTakenPhone.status !== 400) throw new Error('send-code should reject a phone already claimed by a different account');
 
 // --- Admin reset endpoint (must run last — it wipes all state including sessions) ---
 

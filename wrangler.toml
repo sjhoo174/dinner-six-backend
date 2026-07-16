@@ -11,6 +11,14 @@ compatibility_date = "2026-06-28"
 #     (POST /admin/reset with header "X-Admin-Key: <value>" wipes all
 #      registrations/matches/ratings/sessions/users back to empty state.
 #      The route 404s until this secret is set.)
+#   npx wrangler secret put TWILIO_ACCOUNT_SID
+#   npx wrangler secret put TWILIO_AUTH_TOKEN
+#   npx wrangler secret put TWILIO_VERIFY_SERVICE_SID
+#     (SMS phone verification via Twilio Verify — POST /phone/send-code and
+#      /phone/verify-code, gating POST /registrations on a verified phone.
+#      Until all three secrets are set, verification is skipped entirely and
+#      registration is not gated on it — same pattern as TURNSTILE_SECRET_KEY.
+#      Create the Verify Service in the Twilio console under Verify > Services.)
 #
 # Required Google OAuth redirect URI:
 #   https://dinner-six-backend.shijanhoo.workers.dev/auth/google/callback

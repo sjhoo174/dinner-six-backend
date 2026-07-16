@@ -7,6 +7,7 @@ const memory = {
   matchGroupMembers: new Map(),
   ratings: new Map(),
   reports: new Map(),
+  phoneVerifications: new Map(),
 };
 
 export const defaultRestaurants = [
@@ -442,6 +443,74 @@ async function verifyTurnstile(token, remoteIp, env) {
   return Boolean(data.success);
 }
 
+// Twilio Verify integration. Mirrors verifyTurnstile's pattern: if the
+// secrets aren't configured yet, phone verification is skipped entirely
+// (registration is not gated on it) rather than hard-failing every signup.
+function twilioConfigured(env) {
+  return Boolean(env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN && env.TWILIO_VERIFY_SERVICE_SID);
+}
+function twilioAuthHeader(env) {
+  return 'Basic ' + btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`);
+}
+async function twilioStartVerification(env, phone) {
+  const url = `https://verify.twilio.com/v2/Services/${env.TWILIO_VERIFY_SERVICE_SID}/Verifications`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { Authorization: twilioAuthHeader(env), 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ To: phone, Channel: 'sms' }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.message || 'Could not send verification code');
+  return data;
+}
+async function twilioCheckVerification(env, phone, code) {
+  const url = `https://verify.twilio.com/v2/Services/${env.TWILIO_VERIFY_SERVICE_SID}/VerificationCheck`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { Authorization: twilioAuthHeader(env), 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ To: phone, Code: code }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.message || 'Could not check verification code');
+  return data;
+}
+
+async function getPhoneVerification(env, email, phone) {
+  if (hasD1(env)) {
+    return env.DB.prepare('SELECT email, phone, verified, last_sent_at AS lastSentAt, verified_at AS verifiedAt FROM phone_verifications WHERE email = ? AND phone = ?')
+      .bind(email, phone).first();
+  }
+  return memory.phoneVerifications.get(`${email}:${phone}`) || null;
+}
+async function recordVerificationSent(env, email, phone) {
+  const now = nowIso();
+  if (hasD1(env)) {
+    await env.DB.prepare(`INSERT INTO phone_verifications (email, phone, verified, last_sent_at)
+      VALUES (?, ?, 0, ?)
+      ON CONFLICT(email, phone) DO UPDATE SET last_sent_at = excluded.last_sent_at`)
+      .bind(email, phone, now).run();
+  } else {
+    const key = `${email}:${phone}`;
+    const existing = memory.phoneVerifications.get(key) || { email, phone, verified: 0, verifiedAt: null };
+    memory.phoneVerifications.set(key, { ...existing, lastSentAt: now });
+  }
+}
+async function recordVerificationConfirmed(env, email, phone) {
+  const now = nowIso();
+  if (hasD1(env)) {
+    await env.DB.prepare(`UPDATE phone_verifications SET verified = 1, verified_at = ? WHERE email = ? AND phone = ?`)
+      .bind(now, email, phone).run();
+  } else {
+    const key = `${email}:${phone}`;
+    const existing = memory.phoneVerifications.get(key) || { email, phone, lastSentAt: null };
+    memory.phoneVerifications.set(key, { ...existing, verified: 1, verifiedAt: now });
+  }
+}
+async function isPhoneVerified(env, email, phone) {
+  const record = await getPhoneVerification(env, email, phone);
+  return Boolean(record && Number(record.verified) === 1);
+}
+
 function backendBase(request, env) { return env.PUBLIC_BACKEND_URL || new URL(request.url).origin; }
 function oauthRedirectUri(request, env) { return env.GOOGLE_REDIRECT_URI || `${backendBase(request, env)}/auth/google/callback`; }
 function safeReturnTo(value, env) {
@@ -485,6 +554,7 @@ async function handle(request, env = {}) {
     if (hasD1(env)) {
       await env.DB.batch([
         env.DB.prepare('DELETE FROM ratings'),
+        env.DB.prepare('DELETE FROM phone_verifications'),
         env.DB.prepare('DELETE FROM match_group_members'),
         env.DB.prepare('DELETE FROM match_groups'),
         env.DB.prepare('DELETE FROM registrations'),
@@ -494,6 +564,7 @@ async function handle(request, env = {}) {
       ]);
     } else {
       memory.ratings.clear();
+      memory.phoneVerifications.clear();
       memory.matchGroupMembers.clear();
       memory.matchGroups.clear();
       memory.registrations.clear();
@@ -650,6 +721,53 @@ async function handle(request, env = {}) {
     return json({ registration: await currentRegistration(user.email, dinnerType, env) }, 200, request, env);
   }
 
+  if (path === '/phone/send-code' && request.method === 'POST') {
+    if (!twilioConfigured(env)) return json({ error: 'Phone verification is not configured' }, 503, request, env);
+    const body = await request.json().catch(() => ({}));
+    const phone = String(body.phone || '').trim();
+    if (!phone) return json({ error: 'Phone number is required' }, 400, request, env);
+
+    // Same uniqueness rule registration enforces — no point sending a code
+    // for a number that's already claimed by a different account.
+    const owner = hasD1(env)
+      ? await env.DB.prepare('SELECT email FROM users WHERE phone = ? AND email != ?').bind(phone, user.email).first()
+      : [...memory.users.values()].find(u => u.phone === phone && u.email !== user.email);
+    if (owner) return json({ error: 'This phone number is already registered to another account.' }, 400, request, env);
+
+    const existing = await getPhoneVerification(env, user.email, phone);
+    const cooldownMs = 60000;
+    if (existing?.lastSentAt && Date.now() - new Date(existing.lastSentAt).getTime() < cooldownMs) {
+      return json({ error: 'Please wait a moment before requesting another code.' }, 429, request, env);
+    }
+
+    try {
+      await twilioStartVerification(env, phone);
+    } catch (err) {
+      return json({ error: err.message || 'Could not send verification code' }, 502, request, env);
+    }
+    await recordVerificationSent(env, user.email, phone);
+    return json({ success: true }, 200, request, env);
+  }
+
+  if (path === '/phone/verify-code' && request.method === 'POST') {
+    if (!twilioConfigured(env)) return json({ error: 'Phone verification is not configured' }, 503, request, env);
+    const body = await request.json().catch(() => ({}));
+    const phone = String(body.phone || '').trim();
+    const code = String(body.code || '').trim();
+    if (!phone || !code) return json({ error: 'Phone number and code are required' }, 400, request, env);
+
+    let result;
+    try {
+      result = await twilioCheckVerification(env, phone, code);
+    } catch (err) {
+      return json({ error: err.message || 'Could not check verification code' }, 502, request, env);
+    }
+    if (result.status !== 'approved') return json({ error: 'Incorrect or expired code' }, 400, request, env);
+
+    await recordVerificationConfirmed(env, user.email, phone);
+    return json({ success: true, verified: true }, 200, request, env);
+  }
+
   if (path === '/registrations' && request.method === 'POST') {
     const requester = await getUser(env, user.email);
     if (requester?.banned) return json({ error: 'Your account has been suspended and can no longer register.' }, 403, request, env);
@@ -679,6 +797,14 @@ async function handle(request, env = {}) {
           return json({ error: 'You can register again 6 hours after rejecting a table.', retryAt: new Date(retryAt).toISOString() }, 400, request, env);
         }
       }
+    }
+
+    // Require SMS verification for this exact phone number before it can be
+    // used on a registration — skipped only while Twilio isn't configured
+    // yet, same graceful-degradation pattern verifyTurnstile uses.
+    if (twilioConfigured(env)) {
+      const phoneVerified = await isPhoneVerified(env, user.email, profile.phone);
+      if (!phoneVerified) return json({ error: 'Please verify your phone number before registering.' }, 400, request, env);
     }
 
     // A phone number identifies one account, same as email — block reuse
